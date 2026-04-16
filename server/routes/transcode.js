@@ -13,11 +13,12 @@ const transcodeSession = require('../services/transcodeSession');
  *   GET /api/transcode?url=...
  * 
  * HLS session-based (new, supports seeking):
- *   POST /api/transcode/session        - Create new session
+ *   POST /api/transcode/session         - Create new session
  *   GET  /api/transcode/:id/stream.m3u8 - Get HLS playlist
  *   GET  /api/transcode/:id/:segment.ts - Get segment file
- *   DELETE /api/transcode/:id          - Stop and cleanup session
- *   GET /api/transcode/sessions        - List all sessions (debug)
+ *   GET  /api/transcode/:id/:file.vtt   - Get sidecar subtitle file
+ *   DELETE /api/transcode/:id           - Stop and cleanup session
+ *   GET  /api/transcode/sessions        - List all sessions (debug)
  */
 
 // Start session cleanup interval
@@ -61,7 +62,7 @@ router.post('/session', async (req, res) => {
         await session.start();
 
         // Wait for playlist to be ready (first segments generated)
-        const ready = await session.waitForPlaylist(15000);
+        const ready = await session.waitForPlaylist(60000);
 
         if (!ready) {
             await transcodeSession.removeSession(session.id);
@@ -84,29 +85,33 @@ router.post('/session', async (req, res) => {
  * Get HLS playlist for a session
  * GET /api/transcode/:sessionId/stream.m3u8
  */
-router.get('/:sessionId/stream.m3u8', async (req, res) => {
-    const { sessionId } = req.params;
+router.get('/:sessionId/:playlist(.+\\.m3u8)', async (req, res) => {
+    const { sessionId, playlist } = req.params;
     const session = transcodeSession.getSession(sessionId);
 
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
 
-    const playlist = await session.getPlaylist();
-    if (!playlist) {
+    if (!playlist.endsWith('.m3u8')) {
+        return res.status(404).json({ error: 'Invalid playlist' });
+    }
+
+    const playlistContent = await session.getPlaylist(playlist);
+    if (!playlistContent) {
         return res.status(404).json({ error: 'Playlist not ready' });
     }
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
-    res.send(playlist);
+    res.send(playlistContent);
 });
 
 /**
  * Get a segment file for a session
  * GET /api/transcode/:sessionId/:segment.ts
  */
-router.get('/:sessionId/:segment', async (req, res) => {
+router.get('/:sessionId/:segment(.+\\.ts)', async (req, res) => {
     const { sessionId, segment } = req.params;
 
     // Only handle .ts files
@@ -127,6 +132,32 @@ router.get('/:sessionId/:segment', async (req, res) => {
     res.setHeader('Content-Type', 'video/MP2T');
     res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache forever (immutable)
     res.sendFile(segmentPath);
+});
+
+/**
+ * Get a sidecar subtitle file for a session
+ * GET /api/transcode/:sessionId/:file.vtt
+ */
+router.get('/:sessionId/:subtitle(.+\\.vtt)', async (req, res) => {
+    const { sessionId, subtitle } = req.params;
+
+    if (!subtitle.endsWith('.vtt')) {
+        return res.status(404).json({ error: 'Invalid subtitle file' });
+    }
+
+    const session = transcodeSession.getSession(sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const subtitlePath = await session.getSegment(subtitle);
+    if (!subtitlePath) {
+        return res.status(404).json({ error: 'Subtitle file not found' });
+    }
+
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(subtitlePath);
 });
 
 /**
@@ -200,7 +231,7 @@ router.get('/', async (req, res) => {
         '-i', url,
         // Map only first video and audio stream (avoid subtitle streams causing issues)
         '-map', '0:v:0',
-        '-map', '0:a:0?', // ? makes audio optional if not present
+        '-map', '0:a?', // ? makes audio optional if not present
         // Video: passthrough (no re-encoding = fast!)
         '-c:v', 'copy',
         // Audio: Transcode to browser-compatible AAC

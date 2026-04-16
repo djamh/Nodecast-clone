@@ -306,9 +306,20 @@ class VideoPlayer {
         this.captionsList = document.getElementById('player-captions-list');
         this.captionsMenuOpen = false;
 
+        // Audio
+        this.audioBtn = document.getElementById('player-audio-btn');
+        this.audioMenu = document.getElementById('player-audio-menu');
+        this.audioList = document.getElementById('player-audio-list');
+        this.audioMenuOpen = false;
+
         this.captionsBtn?.addEventListener('click', (e) => {
             e.stopPropagation();
             this.toggleCaptionsMenu();
+        });
+
+        this.audioBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleAudioMenu();
         });
 
         // Close captions menu when clicking outside
@@ -317,6 +328,12 @@ class VideoPlayer {
                 !this.captionsMenu.contains(e.target) &&
                 !this.captionsBtn.contains(e.target)) {
                 this.closeCaptionsMenu();
+            }
+
+            if (this.audioMenuOpen &&
+                !this.audioMenu.contains(e.target) &&
+                !this.audioBtn.contains(e.target)) {
+                this.closeAudioMenu();
             }
         });
 
@@ -727,6 +744,12 @@ class VideoPlayer {
             // Detect audio track switches (can cause audio glitches on some streams)
             this.hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
                 console.log('Audio track switched:', data);
+                this.updateAudioTracks();
+            });
+            
+            this.hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+                console.log('Audio tracks updated:', this.hls.audioTracks);
+                this.updateAudioTracks();
             });
 
             // Detect buffer stalls which may indicate codec issues
@@ -768,6 +791,7 @@ class VideoPlayer {
             });
 
             this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                this.updateAudioTracks(); // 👈 ADD THIS
                 this.video.play().catch(e => console.log('Autoplay prevented:', e));
             });
         }
@@ -978,22 +1002,7 @@ class VideoPlayer {
 
                     // Actually, easiest way is to re-assign streamUrl and goto start? No.
                     // Copy existing forceTranscode block logic
-                    if (this.hls) {
-                        this.hls.destroy();
-                    }
-                    this.hls = new Hls();
-                    this.hls.loadSource(playlistUrl);
-                    this.hls.attachMedia(this.video);
-                    this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                        this.video.play().catch(console.error);
-                    });
-                    // Handle errors
-                    this.hls.on(Hls.Events.ERROR, (event, data) => {
-                        if (data.fatal) {
-                            console.log('[Player] HLS fatal error');
-                            this.hls.destroy();
-                        }
-                    });
+                  this.playHls(playlistUrl);
 
                     return; // Exit
                 }
@@ -1198,7 +1207,24 @@ class VideoPlayer {
         this.hls.loadSource(url);
         this.hls.attachMedia(this.video);
 
+        this.hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+            console.log('[Player] playHls AUDIO_TRACKS_UPDATED', this.hls.audioTracks);
+            this.updateAudioTracks();
+        });
+
+        this.hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
+            console.log('[Player] playHls AUDIO_TRACK_SWITCHED', data);
+            this.updateAudioTracks();
+        });
+
+        this.hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (event, data) => {
+            console.log('[Player] playHls SUBTITLE_TRACKS_UPDATED', data.subtitleTracks);
+            setTimeout(() => this.updateCaptionsTracks(), 100);
+        });
+
         this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            this.updateAudioTracks();
+            setTimeout(() => this.updateCaptionsTracks(), 100);
             this.video.play().catch(e => {
                 if (e.name !== 'AbortError') console.log('Autoplay prevented:', e);
             });
@@ -1564,6 +1590,97 @@ class VideoPlayer {
             this.container.requestFullscreen();
         }
     }
+
+    /**
+     * Toggle Audio Menu
+     */
+    toggleAudioMenu() {
+        if (!this.audioMenu) return;
+
+        const willOpen = this.audioMenu.classList.contains('hidden');
+        this.closeCaptionsMenu?.(); // optional: close subtitles menu if open
+
+        if (willOpen) {
+            this.audioMenu.classList.remove('hidden');
+            this.audioMenuOpen = true;
+            this.updateAudioTracks();
+        } else {
+            this.closeAudioMenu();
+        }
+    }
+
+
+    /**
+     * Close Audio Menu
+     */
+    closeAudioMenu() {
+        if (!this.audioMenu) return;
+        this.audioMenu.classList.add('hidden');
+        this.audioMenuOpen = false;
+    }
+
+
+    /**
+     * Update audio tracks
+     */
+    updateAudioTracks() {
+        if (!this.audioList) return;
+
+        let tracks = [];
+
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks.length > 0) {
+            tracks = this.hls.audioTracks;
+        } else if (this.video && this.video.audioTracks && this.video.audioTracks.length > 0) {
+            tracks = Array.from(this.video.audioTracks);
+        }
+
+        if (!tracks.length) {
+            this.audioList.innerHTML = `<button class="captions-option active" data-index="-1">No audio tracks found</button>`;
+            return;
+        }
+
+        const currentIndex = this.hls ? this.hls.audioTrack : tracks.findIndex(t => t.enabled);
+
+        this.audioList.innerHTML = tracks.map((track, index) => {
+            const label =
+                track.name ||
+                track.label ||
+                track.lang ||
+                track.language ||
+                `Track ${index + 1}`;
+
+            return `
+                <button class="captions-option ${index === currentIndex ? 'active' : ''}" data-index="${index}">
+                    ${label}
+                </button>
+            `;
+        }).join('');
+
+        this.audioList.querySelectorAll('[data-index]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const index = parseInt(btn.dataset.index, 10);
+                this.selectAudioTrack(index);
+            });
+        });
+    }
+
+
+    /**
+     * Select audio track
+     */
+    selectAudioTrack(index) {
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks[index]) {
+            this.hls.audioTrack = index;
+        } else if (this.video && this.video.audioTracks && this.video.audioTracks[index]) {
+            Array.from(this.video.audioTracks).forEach((track, i) => {
+                track.enabled = i === index;
+            });
+        }
+
+        this.updateAudioTracks();
+        this.closeAudioMenu();
+    }
+
 }
 
 // Export

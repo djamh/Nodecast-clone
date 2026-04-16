@@ -59,6 +59,9 @@ class TranscodeSession extends EventEmitter {
         this.url = url;
         this.dir = path.join(CACHE_DIR, this.id);
         this.playlistPath = path.join(this.dir, 'stream.m3u8');
+        this.variantPlaylistPattern = path.join(this.dir, '%v.m3u8');
+        this.segmentFilenamePattern = path.join(this.dir, '%v_seg_%04d.ts');
+        this.inputStreamInfo = null;
         this.process = null;
         this.segments = new Map(); // segment index -> { ready: boolean, path: string }
         this.status = 'pending'; // pending | starting | running | stopped | error
@@ -100,7 +103,40 @@ class TranscodeSession extends EventEmitter {
             throw err;
         }
 
+        
         // Build FFmpeg arguments for HLS output
+
+        /*calling the method to create the list of audio output*/ 
+                try {
+                    this.inputStreamInfo = await this.probeInputStreams();
+
+                    const audioCount = this.inputStreamInfo?.audioTracks?.length || 0;
+                    const subtitleCount = this.inputStreamInfo?.subtitleTracks?.length || 0;
+
+                    console.log(
+                        `[TranscodeSession ${this.id}] Input probe: ${audioCount} audio track(s), ${subtitleCount} subtitle track(s)`
+                    );
+
+                    if (audioCount > 0) {
+                        this.inputStreamInfo.audioTracks.forEach((track, i) => {
+                            console.log(
+                                `[TranscodeSession ${this.id}] Audio track ${i}: stream=${track.streamIndex}, lang=${track.language}`
+                            );
+                        });
+                    }
+
+                    if (subtitleCount > 0) {
+                        this.inputStreamInfo.subtitleTracks.forEach((track, i) => {
+                            console.log(
+                                `[TranscodeSession ${this.id}] Subtitle track ${i}: stream=${track.streamIndex}, lang=${track.language}, codec=${track.codec}`
+                            );
+                        });
+                    }
+                } catch (err) {
+                    console.warn(`[TranscodeSession ${this.id}] Input stream probe failed:`, err.message);
+                    this.inputStreamInfo = { audioTracks: [], subtitleTracks: [] };
+                }
+
         const args = this.buildFFmpegArgs();
 
         console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
@@ -166,19 +202,171 @@ class TranscodeSession extends EventEmitter {
         }
     }
 
+    
+async probeInputStreams() {
+    const ffmpegPath = this.options.ffmpegPath || 'ffmpeg';
+
+    return new Promise((resolve) => {
+        const args = [
+            '-hide_banner',
+            '-loglevel', 'info',
+            '-user_agent', this.options.userAgent,
+            '-probesize', '5000000',
+            '-analyzeduration', '5000000',
+            '-i', this.url,
+            '-f', 'null',
+            '-'
+        ];
+
+
+
+        /*Prepare to have a master playlist in the session*/ 
+            const proc = spawn(ffmpegPath, args, { windowsHide: true });
+
+            let stderr = '';
+            let settled = false;
+
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+
+                const lines = stderr.split('\n');
+
+                const audioTracks = [];
+                const subtitleTracks = [];
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+
+                    if (trimmed.includes('Stream #') && trimmed.includes('Subtitle:')) {
+                        const match = trimmed.match(/Stream #(\d+):(\d+)(?:\(([^)]+)\))?: Subtitle:\s*([^,]+)/);
+                        if (match) {
+                            subtitleTracks.push({
+                                programIndex: parseInt(match[1], 10),
+                                streamIndex: parseInt(match[2], 10),
+                                language: match[3] || 'und',
+                                codec: match[4].trim().toLowerCase(),
+                                raw: trimmed
+                            });
+                        }
+                    }
+
+                    if (trimmed.includes('Stream #') && trimmed.includes('Audio:')) {
+                        const match = trimmed.match(/Stream #(\d+):(\d+)(?:\(([^)]+)\))?: Audio:/);
+                        if (match) {
+                            audioTracks.push({
+                                programIndex: parseInt(match[1], 10),
+                                streamIndex: parseInt(match[2], 10),
+                                language: match[3] || 'und',
+                                raw: trimmed
+                            });
+                        }
+                    }
+                }
+
+                const uniqueAudioTracks = [];
+                const seenAudio = new Set();
+
+                for (const track of audioTracks) {
+                    const key = `${track.programIndex}:${track.streamIndex}`;
+                    if (!seenAudio.has(key)) {
+                        seenAudio.add(key);
+                        uniqueAudioTracks.push(track);
+                    }
+                }
+
+                const uniqueSubtitleTracks = [];
+                const seenSubtitles = new Set();
+
+                for (const track of subtitleTracks) {
+                    const key = `${track.programIndex}:${track.streamIndex}`;
+                    if (!seenSubtitles.has(key)) {
+                        seenSubtitles.add(key);
+                        uniqueSubtitleTracks.push(track);
+                    }
+                }
+
+                resolve({
+                    audioTracks: uniqueAudioTracks,
+                    subtitleTracks: uniqueSubtitleTracks
+                });
+
+            };
+
+            proc.stderr.on('data', (data) => {
+                stderr += data.toString();
+
+                // Once FFmpeg has printed stream info, we can stop early
+                if (stderr.includes('Stream #')) {
+                    setTimeout(() => {
+                        try { proc.kill('SIGKILL'); } catch {}
+                        finish();
+                    }, 500);
+                }
+            });
+
+            proc.on('error', () => finish());
+            proc.on('exit', () => finish());
+
+            setTimeout(() => {
+                try { proc.kill('SIGKILL'); } catch {}
+                finish();
+            }, 8000);
+        });
+    }
+
+    /*Check if the method to use multiple audio is needed*/ 
+    shouldUseMultiAudioHls() {
+    const audioTracks = this.inputStreamInfo?.audioTracks || [];
+    return audioTracks.length > 1;
+    }
+
+    getTextSubtitleTracks() {
+        const subtitleTracks = this.inputStreamInfo?.subtitleTracks || [];
+        const unsupportedCodecs = new Set([
+            'hdmv_pgs_subtitle',
+            'pgssub',
+            'dvd_subtitle',
+            'xsub'
+        ]);
+
+        return subtitleTracks.filter(track => !unsupportedCodecs.has(track.codec));
+    }
+
+    shouldUseSubtitleHls() {
+        return this.getTextSubtitleTracks().length > 0;
+    }
+
+    getSidecarSubtitleTracks() {
+        return this.getTextSubtitleTracks().map((track, i) => ({
+            ...track,
+            outputName: `sub_${i}.vtt`
+        }));
+    }
+
+
     /**
      * Build FFmpeg arguments for HLS output with optional GPU encoding
      */
     buildFFmpegArgs() {
         const segmentPattern = path.join(this.dir, 'seg%04d.m4s');
         const videoMode = this.options.videoMode || 'encode';
+        const useMultiAudioHls = this.shouldUseMultiAudioHls();
+        const textSubtitleTracks = this.getTextSubtitleTracks();
+        const sidecarSubtitleTracks = this.getSidecarSubtitleTracks();
+        const useSubtitleHls = textSubtitleTracks.length > 0;
 
         // Resolve 'auto' encoder to detected hardware, fallback to software
         let encoder = this.options.hwEncoder || 'software';
         if (encoder === 'auto') {
             const hwCaps = hwDetect.getCapabilities();
-            encoder = hwCaps?.recommended || 'software';
-            console.log(`[TranscodeSession ${this.id}] Auto encoder resolved to: ${encoder}`);
+            const recommendedEncoder = hwCaps?.recommended || 'software';
+
+            encoder = recommendedEncoder === 'amf' ? 'software' : recommendedEncoder;
+
+            console.log(
+                `[TranscodeSession ${this.id}] Auto encoder resolved to: ${recommendedEncoder} (using ${encoder})`
+            );
         }
 
         const args = [
@@ -186,6 +374,12 @@ class TranscodeSession extends EventEmitter {
             '-loglevel', 'warning',
             '-user_agent', this.options.userAgent,
         ];
+        
+        if (useMultiAudioHls) {
+            console.log(
+                `[TranscodeSession ${this.id}] Multi-audio HLS mode requested for ${this.inputStreamInfo.audioTracks.length} audio tracks`
+            );
+        }
 
         // Add hardware acceleration input options based on encoder (only if encoding)
         if (videoMode === 'encode') {
@@ -212,7 +406,15 @@ class TranscodeSession extends EventEmitter {
 
         // Map streams
         args.push('-map', '0:v:0');
-        args.push('-map', '0:a:0?');
+
+        if (useMultiAudioHls) {
+            const audioTracks = this.inputStreamInfo?.audioTracks || [];
+            audioTracks.forEach((track, i) => {
+                args.push('-map', `0:a:${i}`);
+            });
+        } else {
+            args.push('-map', '0:a?');
+        }
 
         // Add video encoder and filters based on selected encoder OR copy
         if (videoMode === 'copy') {
@@ -229,6 +431,60 @@ class TranscodeSession extends EventEmitter {
             }
         } else {
             this.addVideoEncoderArgs(args, encoder);
+        }
+
+        /*Early return in case of multi audio*/ 
+        if (useMultiAudioHls) {
+            console.log(`[TranscodeSession ${this.id}] Building master-playlist HLS with alternate audio`);
+
+            // Keep video settings from above, but force all audio tracks to AAC stereo
+            args.push(
+                '-c:a', 'aac',
+                '-ac:a', '2',
+                '-ar:a', '48000',
+                '-b:a', '192k'
+            );
+
+            const audioTracks = this.inputStreamInfo?.audioTracks || [];
+            const audioEntries = audioTracks.map((track, i) => {
+                const lang = (track.language || 'und').toLowerCase();
+                const safeName = lang === 'und' ? `audio${i + 1}` : lang;
+                const defaultFlag = i === 0 ? 'yes' : 'no';
+                return `a:${i},agroup:audio,language:${lang},name:${safeName},default:${defaultFlag}`;
+            });
+
+            const varStreamMap = [
+                'v:0,agroup:audio',
+                ...audioEntries
+            ].join(' ');
+
+            args.push(
+                '-master_pl_name', 'stream.m3u8',
+                '-var_stream_map', varStreamMap,
+                '-f', 'hls',
+                '-hls_time', String(SEGMENT_DURATION),
+                '-hls_list_size', '0',
+                '-hls_flags', 'independent_segments+append_list',
+                '-hls_segment_type', 'mpegts',
+                '-hls_segment_filename', this.segmentFilenamePattern,
+                this.variantPlaylistPattern
+            );
+
+            if (sidecarSubtitleTracks.length > 0) {
+                const firstSubtitle = sidecarSubtitleTracks[0];
+                console.log(
+                    `[TranscodeSession ${this.id}] Writing sidecar subtitle: stream=${firstSubtitle.streamIndex}, file=${firstSubtitle.outputName}`
+                );
+
+                args.push(
+                    '-map', `0:${firstSubtitle.streamIndex}`,
+                    '-c:s', 'webvtt',
+                    '-f', 'webvtt',
+                    path.join(this.dir, firstSubtitle.outputName)
+                );
+            }
+
+            return args;
         }
 
         // Audio: Apply mix preset
@@ -282,6 +538,8 @@ class TranscodeSession extends EventEmitter {
 
         return args;
     }
+
+
 
     /**
      * Add hardware acceleration input arguments
@@ -506,7 +764,6 @@ class TranscodeSession extends EventEmitter {
             '-preset', 'veryfast',     // Fast for real-time
             '-crf', String(crf),
             '-profile:v', 'high',
-            '-level', '4.1',
             '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility (fixes 10-bit input errors)
         );
     }
@@ -542,8 +799,10 @@ class TranscodeSession extends EventEmitter {
         try {
             await fs.access(this.playlistPath);
             const content = await fs.readFile(this.playlistPath, 'utf8');
-            // Check if playlist has at least one segment
-            return content.includes('.ts');
+
+            // Master playlist is ready if it references at least one child playlist,
+            // or a regular playlist is ready if it references segments.
+           return content.includes('.m3u8') || content.includes('.ts') || content.includes('.vtt') || (await fs.readdir(this.dir)).some(name => name.endsWith('.vtt'));
         } catch {
             return false;
         }
@@ -566,10 +825,13 @@ class TranscodeSession extends EventEmitter {
     /**
      * Get the HLS playlist content
      */
-    async getPlaylist() {
-        this.touch();
-        try {
-            return await fs.readFile(this.playlistPath, 'utf8');
+    async getPlaylist(playlistName = 'stream.m3u8') {
+    this.touch();
+
+    const targetPath = path.join(this.dir, playlistName);
+
+    try {
+            return await fs.readFile(targetPath, 'utf8');
         } catch (err) {
             return null;
         }

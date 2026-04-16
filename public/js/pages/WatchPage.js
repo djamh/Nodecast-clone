@@ -65,6 +65,11 @@ class WatchPage {
         this.captionsMenu = document.getElementById('watch-captions-menu');
         this.captionsList = document.getElementById('watch-captions-list');
 
+        // Audio
+        this.audioBtn = document.getElementById('watch-audio-btn');
+        this.audioMenu = document.getElementById('watch-audio-menu');
+        this.audioList = document.getElementById('watch-audio-list');
+
         // Transcode Status
         this.transcodeStatusEx = document.getElementById('watch-transcode-status');
         this.qualityBadgeEl = document.getElementById('watch-quality-badge');
@@ -79,6 +84,9 @@ class WatchPage {
         this.isFavorite = false;
         this.returnPage = null;
         this.captionsMenuOpen = false;
+        this.audioMenuOpen = false;
+        this.isLoadingVideo = false;
+        this.currentLoadRequestId = 0;
 
         // Overlay timer
         this.overlayTimeout = null;
@@ -222,12 +230,24 @@ class WatchPage {
             this.toggleCaptionsMenu();
         });
 
-        // Close captions menu when clicking outside
+        // Close captions/audio menus when clicking outside
         document.addEventListener('click', (e) => {
             if (this.captionsMenuOpen && !this.captionsMenu?.contains(e.target) && e.target !== this.captionsBtn) {
                 this.closeCaptionsMenu();
             }
+
+            if (this.audioMenuOpen && !this.audioMenu?.contains(e.target) && e.target !== this.audioBtn) {
+                this.closeAudioMenu();
+            }
         });
+
+        // Audio toggle
+        this.audioBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleAudioMenu();
+        });
+
+        
 
         // Hide scroll hint after scrolling
         const watchPage = document.getElementById('page-watch');
@@ -410,6 +430,19 @@ class WatchPage {
     }
 
     async loadVideo(url) {
+
+        /**Track Load Request */
+        const loadRequestId = ++this.currentLoadRequestId;
+
+        if (this.isLoadingVideo) {
+            console.warn('[WatchPage] loadVideo skipped because another load is already in progress');
+            return;
+        }
+
+
+        try {
+        this.isLoadingVideo = true;
+
         // Store the URL for copy functionality
         this.currentUrl = url;
 
@@ -431,6 +464,10 @@ class WatchPage {
         const looksLikeHls = url.includes('.m3u8') || url.includes('m3u8');
         const isRawTs = url.includes('.ts') && !url.includes('.m3u8');
         const isDirectVideo = url.includes('.mp4') || url.includes('.mkv') || url.includes('.avi');
+        const shouldTryDirectFirst = false;
+
+
+       
 
         // Priority 0: Auto Transcode (Smart) - probe first, then decide
         if (settings.autoTranscode) {
@@ -441,9 +478,19 @@ class WatchPage {
                 const info = await probeRes.json();
                 console.log(`[WatchPage] Probe result: video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
 
+                /*Check after probing*/ 
+                const audioTrackCount =
+                    info.audioTrackCount ||
+                    info.audioTracks?.length ||
+                    1;
+
+                
+
                 // Store early probe info for quality display
                 this.currentStreamInfo = info;
                 this.updateQualityBadge();
+
+                
 
                 if (info.needsTranscode || settings.upscaleEnabled) {
                     console.log(`[WatchPage] Auto: Using HLS transcode session (${settings.upscaleEnabled ? 'Upscaling' : 'Incompatible audio/video'})`);
@@ -457,7 +504,8 @@ class WatchPage {
                     this.updateTranscodeStatus(statusMode, statusText);
                     const playlistUrl = await this.startTranscodeSession(url, {
                         videoMode,
-                        seekOffset: this.resumeTime, // Ensure seekOffset is passed
+                       /* seekOffset: this.resumeTime, // Ensure seekOffset is passed*/
+                        seekOffset: 0,
                         videoCodec: info.video,
                         audioCodec: info.audio,
                         audioChannels: info.audioChannels
@@ -558,6 +606,13 @@ class WatchPage {
         }
 
         this.setVolumeFromStorage();
+
+
+            } finally {
+                if (this.currentLoadRequestId === loadRequestId) {
+                    this.isLoadingVideo = false;
+                }
+            }
     }
 
     /**
@@ -578,6 +633,16 @@ class WatchPage {
         this.hls.loadSource(url);
         this.hls.attachMedia(this.video);
 
+        this.hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
+            console.log('[WatchPage] Audio tracks updated:', data.audioTracks || this.hls.audioTracks);
+            this.updateAudioTracks();
+        });
+
+        this.hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
+            console.log('[WatchPage] Audio track switched:', data);
+            this.updateAudioTracks();
+        });
+
         // Listen for subtitle track updates
         this.hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (event, data) => {
             console.log('[WatchPage] Subtitle tracks updated:', data.subtitleTracks);
@@ -589,7 +654,24 @@ class WatchPage {
             console.log('[WatchPage] Subtitle track switched:', data);
         });
 
+
         this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            console.log('[WatchPage] MANIFEST_PARSED audioTracks:', this.hls.audioTracks);
+
+            if (this.video?.audioTracks) {
+                console.log('[WatchPage] video.audioTracks length:', this.video.audioTracks.length);
+            } else {
+                console.log('[WatchPage] video.audioTracks not supported');
+            }
+
+            if (this.video?.textTracks) {
+                console.log('[WatchPage] video.textTracks length:', this.video.textTracks.length);
+            }
+
+            this.updateAudioTracks();
+            this.attachSidecarSubtitleTrack();
+            setTimeout(() => this.updateCaptionsTracks(), 300);
+
             this.video.play().catch(e => {
                 if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
             });
@@ -610,10 +692,38 @@ class WatchPage {
         });
     }
 
-    setVolumeFromStorage() {
+        setVolumeFromStorage() {
         const savedVolume = localStorage.getItem('nodecast-volume') || '80';
         this.video.volume = parseInt(savedVolume) / 100;
         if (this.volumeSlider) this.volumeSlider.value = savedVolume;
+    }
+
+    attachSidecarSubtitleTrack() {
+        if (!this.video || !this.currentSessionId) return;
+
+        const existing = this.video.querySelector('track[data-sidecar-subtitle="true"]');
+        if (existing) {
+            existing.remove();
+        }
+
+        const trackEl = document.createElement('track');
+        trackEl.kind = 'subtitles';
+        trackEl.label = 'English';
+        trackEl.srclang = 'en';
+        trackEl.src = `/api/transcode/${this.currentSessionId}/sub_0.vtt`;
+        trackEl.default = false;
+        trackEl.setAttribute('data-sidecar-subtitle', 'true');
+
+        trackEl.addEventListener('load', () => {
+            console.log('[WatchPage] Sidecar subtitle loaded:', trackEl.src);
+            this.updateCaptionsTracks();
+        });
+
+        trackEl.addEventListener('error', () => {
+            console.warn('[WatchPage] Sidecar subtitle failed to load:', trackEl.src);
+        });
+
+        this.video.appendChild(trackEl);
     }
 
     stop() {
@@ -643,6 +753,8 @@ class WatchPage {
 
         this.hideNowPlaying();
     }
+
+  
 
     // === Playback Controls ===
 
@@ -902,6 +1014,83 @@ class WatchPage {
     closeCaptionsMenu() {
         this.captionsMenu?.classList.add('hidden');
         this.captionsMenuOpen = false;
+    }
+
+    toggleAudioMenu() {
+        if (this.audioMenuOpen) {
+            this.closeAudioMenu();
+        } else {
+            this.updateAudioTracks();
+            this.audioMenu?.classList.remove('hidden');
+            this.audioMenuOpen = true;
+        }
+    }
+
+    closeAudioMenu() {
+        this.audioMenu?.classList.add('hidden');
+        this.audioMenuOpen = false;
+    }
+
+    updateAudioTracks() {
+        if (!this.audioList) return;
+
+        let tracks = [];
+
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks.length > 0) {
+            tracks = this.hls.audioTracks;
+        } else if (this.video?.audioTracks && this.video.audioTracks.length > 0) {
+            tracks = Array.from(this.video.audioTracks);
+        }
+
+        console.log('[WatchPage] updateAudioTracks raw tracks:', tracks);
+        if (!tracks.length) {
+            this.audioList.innerHTML = '<button class="captions-option active" data-index="-1">No audio tracks found</button>';
+            return;
+        }
+
+        const currentIndex = this.hls
+            ? this.hls.audioTrack
+            : tracks.findIndex(track => track.enabled);
+
+        let html = '';
+
+        for (let i = 0; i < tracks.length; i++) {
+            const track = tracks[i];
+            const label =
+                track.name ||
+                track.label ||
+                track.lang ||
+                track.language ||
+                `Track ${i + 1}`;
+
+            const isActive = i === currentIndex;
+            html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${i}">${label}</button>`;
+        }
+
+        this.audioList.innerHTML = html;
+
+        this.audioList.querySelectorAll('.captions-option').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const index = parseInt(btn.dataset.index, 10);
+                this.selectAudioTrack(index);
+            });
+        });
+    }
+
+    selectAudioTrack(index) {
+        if (index < 0) return;
+
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks[index]) {
+            this.hls.audioTrack = index;
+        } else if (this.video?.audioTracks && this.video.audioTracks[index]) {
+            Array.from(this.video.audioTracks).forEach((track, i) => {
+                track.enabled = i === index;
+            });
+        }
+
+        this.updateAudioTracks();
+        this.closeAudioMenu();
     }
 
     updateCaptionsTracks() {
