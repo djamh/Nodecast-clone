@@ -2,6 +2,10 @@
   <img src="public/img/logo-banner.png" alt="nodecast-tv" height="60" />
 </p>
 
+Original is here
+https://github.com/technomancer702/nodecast-tv/
+Simply a local version that works for my specs
+
 # What is nodecast-tv?
 
 nodecast-tv is a modern, web-based IPTV player featuring Live TV, EPG, Movies (VOD), and Series support. Built with performance and user experience in mind.
