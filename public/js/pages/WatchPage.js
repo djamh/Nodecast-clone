@@ -87,6 +87,8 @@ class WatchPage {
         this.audioMenuOpen = false;
         this.isLoadingVideo = false;
         this.currentLoadRequestId = 0;
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
 
         // Overlay timer
         this.overlayTimeout = null;
@@ -361,6 +363,8 @@ class WatchPage {
             if (!res.ok) throw new Error('Failed to start session');
             const session = await res.json();
             this.currentSessionId = session.sessionId;
+            this.currentSubtitleTracks = Array.isArray(session.subtitleTracks) ? session.subtitleTracks : [];
+            console.log('[WatchPage] Session subtitle tracks:', this.currentSubtitleTracks);
             return session.playlistUrl;
         } catch (err) {
             console.error('[WatchPage] Session start failed:', err);
@@ -383,6 +387,9 @@ class WatchPage {
             }
             this.currentSessionId = null;
         }
+
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
     }
 
     async updateTranscodeStatus(mode, text) {
@@ -445,6 +452,10 @@ class WatchPage {
 
         // Store the URL for copy functionality
         this.currentUrl = url;
+
+        // Reset subtitle state before loading a new source
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
 
         // Stop any existing playback
         this.stop();
@@ -669,7 +680,7 @@ class WatchPage {
             }
 
             this.updateAudioTracks();
-            this.attachSidecarSubtitleTrack();
+            this.clearSidecarSubtitleTracks();
             setTimeout(() => this.updateCaptionsTracks(), 300);
 
             this.video.play().catch(e => {
@@ -698,32 +709,61 @@ class WatchPage {
         if (this.volumeSlider) this.volumeSlider.value = savedVolume;
     }
 
-    attachSidecarSubtitleTrack() {
-        if (!this.video || !this.currentSessionId) return;
+    clearSidecarSubtitleTracks() {
+    if (!this.video) return;
 
-        const existing = this.video.querySelector('track[data-sidecar-subtitle="true"]');
-        if (existing) {
-            existing.remove();
-        }
+    const existingTracks = this.video.querySelectorAll('track[data-sidecar-subtitle="true"]');
+    existingTracks.forEach(track => track.remove());
+    }
+
+    attachSelectedSidecarSubtitleTrack(subtitleTrack) {
+        if (!this.video || !subtitleTrack) return;
+
+        this.clearSidecarSubtitleTracks();
 
         const trackEl = document.createElement('track');
         trackEl.kind = 'subtitles';
-        trackEl.label = 'English';
-        trackEl.srclang = 'en';
-        trackEl.src = `/api/transcode/${this.currentSessionId}/sub_0.vtt`;
+        trackEl.label = subtitleTrack.label || (subtitleTrack.language || 'und').toUpperCase();
+        trackEl.srclang = subtitleTrack.language || 'und';
+        trackEl.src = subtitleTrack.url;
         trackEl.default = false;
         trackEl.setAttribute('data-sidecar-subtitle', 'true');
 
         trackEl.addEventListener('load', () => {
             console.log('[WatchPage] Sidecar subtitle loaded:', trackEl.src);
+
+            const textTracks = this.video.textTracks;
+            for (let i = 0; i < textTracks.length; i++) {
+                if (textTracks[i].kind === 'subtitles' || textTracks[i].kind === 'captions') {
+                    textTracks[i].mode = 'disabled';
+                }
+            }
+
+            const latestTrack = textTracks[textTracks.length - 1];
+            if (latestTrack && (latestTrack.kind === 'subtitles' || latestTrack.kind === 'captions')) {
+                latestTrack.mode = 'showing';
+            }
+
             this.updateCaptionsTracks();
         });
 
         trackEl.addEventListener('error', () => {
             console.warn('[WatchPage] Sidecar subtitle failed to load:', trackEl.src);
+            this.updateCaptionsTracks();
         });
 
         this.video.appendChild(trackEl);
+
+        setTimeout(() => {
+            const textTracks = this.video.textTracks;
+            const latestTrack = textTracks[textTracks.length - 1];
+
+            if (latestTrack && (latestTrack.kind === 'subtitles' || latestTrack.kind === 'captions')) {
+                console.log('[WatchPage] Forcing subtitle track activation for fetch:', subtitleTrack.url);
+                latestTrack.mode = 'hidden';
+            }
+        }, 0);
+
     }
 
     stop() {
@@ -1094,58 +1134,109 @@ class WatchPage {
     }
 
     updateCaptionsTracks() {
-        if (!this.captionsList || !this.video) return;
+        if (!this.captionsList) return;
 
-        // Build list of available text tracks
-        const tracks = this.video.textTracks;
-        let html = '<button class="captions-option" data-index="-1">Off</button>';
+        const hlsSubtitleTracks =
+            this.hls && Array.isArray(this.hls.subtitleTracks) ? this.hls.subtitleTracks : [];
 
-        for (let i = 0; i < tracks.length; i++) {
-            const track = tracks[i];
-            if (track.kind === 'subtitles' || track.kind === 'captions') {
-                const label = track.label || track.language || `Track ${i + 1}`;
-                const isActive = track.mode === 'showing';
-                html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${i}">${label}</button>`;
-            }
-        }
+        const subtitleOptions =
+            hlsSubtitleTracks.length > 0
+                ? hlsSubtitleTracks
+                : (Array.isArray(this.currentSubtitleTracks) ? this.currentSubtitleTracks : []);
 
-        // Check if any track is active, if not mark "Off" as active
-        let anyActive = false;
-        for (let i = 0; i < tracks.length; i++) {
-            if (tracks[i].mode === 'showing') anyActive = true;
-        }
-        if (!anyActive) {
-            html = html.replace('class="captions-option"', 'class="captions-option active"');
-        }
+        const activeSubtitleIndex =
+            typeof this.activeSubtitleIndex === 'number' ? this.activeSubtitleIndex : -1;
+
+        console.log('[WatchPage] Subtitle menu options:', subtitleOptions);
+
+        let html = `<button class="captions-option ${activeSubtitleIndex < 0 ? 'active' : ''}" data-index="-1">Off</button>`;
+
+        subtitleOptions.forEach((subtitleTrack, index) => {
+            const label =
+                subtitleTrack.name ||
+                subtitleTrack.label ||
+                subtitleTrack.lang ||
+                subtitleTrack.language ||
+                `Track ${index + 1}`;
+
+            const isActive = index === activeSubtitleIndex;
+            html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${index}">${label}</button>`;
+        });
 
         this.captionsList.innerHTML = html;
 
-        // Add click handlers
         this.captionsList.querySelectorAll('.captions-option').forEach(btn => {
-            btn.addEventListener('click', () => this.selectCaptionTrack(parseInt(btn.dataset.index)));
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.selectCaptionTrack(parseInt(btn.dataset.index, 10));
+            });
         });
     }
 
     selectCaptionTrack(index) {
+        console.log('[WatchPage] selectCaptionTrack called with index:', index);
+
         if (!this.video) return;
+
+        const hasHlsSubtitleTracks =
+            this.hls && Array.isArray(this.hls.subtitleTracks) && this.hls.subtitleTracks.length > 0;
+
+        if (hasHlsSubtitleTracks) {
+            if (index < 0) {
+                this.activeSubtitleIndex = -1;
+                this.hls.subtitleTrack = -1;
+                this.updateCaptionsTracks();
+                this.closeCaptionsMenu();
+                return;
+            }
+
+            if (!this.hls.subtitleTracks[index]) {
+                console.warn('[WatchPage] No HLS subtitle track found for index:', index);
+                this.activeSubtitleIndex = -1;
+                this.updateCaptionsTracks();
+                this.closeCaptionsMenu();
+                return;
+            }
+
+            this.activeSubtitleIndex = index;
+            console.log('[WatchPage] Switching HLS subtitle track:', this.hls.subtitleTracks[index]);
+            this.hls.subtitleTrack = index;
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
+        }
 
         const tracks = this.video.textTracks;
 
-        // Disable all tracks
         for (let i = 0; i < tracks.length; i++) {
-            tracks[i].mode = 'hidden';
+            if (tracks[i].kind === 'subtitles' || tracks[i].kind === 'captions') {
+                tracks[i].mode = 'disabled';
+            }
         }
 
-        // Enable selected track
-        if (index >= 0 && index < tracks.length) {
-            tracks[index].mode = 'showing';
+        if (index < 0) {
+            this.activeSubtitleIndex = -1;
+            this.clearSidecarSubtitleTracks();
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
         }
 
-        // Update UI
+        const subtitleTrack = this.currentSubtitleTracks[index];
+        if (!subtitleTrack) {
+            console.warn('[WatchPage] No subtitle metadata found for index:', index);
+            this.activeSubtitleIndex = -1;
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
+        }
+
+        this.activeSubtitleIndex = index;
+        console.log('[WatchPage] Attaching selected subtitle track:', subtitleTrack);
+        this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
         this.updateCaptionsTracks();
         this.closeCaptionsMenu();
     }
-
     // === Overlay Auto-Hide ===
 
     showOverlay() {

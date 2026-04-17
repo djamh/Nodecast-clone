@@ -6,6 +6,28 @@ const fs = require('fs').promises;
 const db = require('../db');
 const transcodeSession = require('../services/transcodeSession');
 
+async function waitForValidVtt(filePath, timeoutMs = 15000) {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const content = await fs.readFile(filePath, 'utf8');
+
+            if (
+                content &&
+                content.trim().length > 0 &&
+                content.includes('WEBVTT')
+            ) {
+                return true;
+            }
+        } catch {}
+
+        await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    return false;
+}
+
 /**
  * Transcode Routes
  * 
@@ -69,10 +91,24 @@ router.post('/session', async (req, res) => {
             return res.status(500).json({ error: 'Transcoding failed to start', reason: 'Playlist not generated in time' });
         }
 
+        const subtitleTracks = session.preloadedSubtitleTrack
+            ? [{
+                index: session.preloadedSubtitleTrack.index,
+                streamIndex: session.preloadedSubtitleTrack.streamIndex,
+                language: session.preloadedSubtitleTrack.language || 'und',
+                codec: session.preloadedSubtitleTrack.codec,
+                label: session.preloadedSubtitleTrack.label || 'UND',
+                url: `/api/transcode/${session.id}/${session.preloadedSubtitleTrack.outputName}`
+            }]
+            : [];
+
+        console.log('[Transcode] Preloaded subtitle tracks:', subtitleTracks);
+
         res.json({
             sessionId: session.id,
             playlistUrl: `/api/transcode/${session.id}/stream.m3u8`,
-            status: session.status
+            status: session.status,
+            subtitleTracks
         });
 
     } catch (err) {
@@ -135,30 +171,32 @@ router.get('/:sessionId/:segment(.+\\.ts)', async (req, res) => {
 });
 
 /**
- * Get a sidecar subtitle file for a session
+ * Get a generated subtitle file for a session
  * GET /api/transcode/:sessionId/:file.vtt
  */
-router.get('/:sessionId/:subtitle(.+\\.vtt)', async (req, res) => {
-    const { sessionId, subtitle } = req.params;
+    router.get('/:sessionId/:subtitle(.+\\.vtt)', async (req, res) => {
+        const { sessionId, subtitle } = req.params;
 
-    if (!subtitle.endsWith('.vtt')) {
-        return res.status(404).json({ error: 'Invalid subtitle file' });
-    }
+        if (!subtitle.endsWith('.vtt')) {
+            return res.status(404).json({ error: 'Invalid subtitle file' });
+        }
 
-    const session = transcodeSession.getSession(sessionId);
-    if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-    }
+        const session = transcodeSession.getSession(sessionId);
+        if (!session) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
 
-    const subtitlePath = await session.getSegment(subtitle);
-    if (!subtitlePath) {
-        return res.status(404).json({ error: 'Subtitle file not found' });
-    }
+        const subtitlePath = await session.getSegment(subtitle);
+        if (!subtitlePath) {
+            return res.status(404).json({ error: 'Subtitle file not found' });
+        }
 
-    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.sendFile(subtitlePath);
-});
+        console.log(`[Transcode] Serving preloaded subtitle file: ${subtitle}`);
+
+        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.sendFile(subtitlePath);
+    });
 
 /**
  * Stop and cleanup a session
