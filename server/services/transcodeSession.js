@@ -832,7 +832,7 @@ class TranscodeSession extends EventEmitter {
             encoder = recommendedEncoder === 'amf' ? 'software' : recommendedEncoder;
 
             console.log(
-                `[TranscodeSession ${this.id}] Auto encoder resolved to: ${recommendedEncoder} (using ${encoder})`
+                `[TranscodeSession ${this.id}] Auto encoder resolved to: ${recommendedEncoder}`
             );
         }
 
