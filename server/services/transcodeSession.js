@@ -140,23 +140,21 @@ class TranscodeSession extends EventEmitter {
                     this.inputStreamInfo = { audioTracks: [], subtitleTracks: [] };
                 }
 
-        this.preloadedSubtitleTrack = await this.preloadFirstSubtitleTrack();
-        const args = this.buildFFmpegArgs();
+               this.preloadedSubtitleTrack = null;
+                const args = this.buildFFmpegArgs();
 
-        console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
+                console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
 
-        try {
-            this.process = spawn(this.options.ffmpegPath, args, {
-                cwd: this.dir,
-                windowsHide: true
-            });
+                try {
+                    this.process = spawn(this.options.ffmpegPath, args, {
+                        cwd: this.dir,
+                        windowsHide: true
+                    });
 
-            this.status = 'running';
-            this.startSourceCacheDownload();
+                    this.status = 'running';
+                    this.startSourceCacheDownload();
 
-            if (!this.preloadedSubtitleTrack) {
-                this.preloadedSubtitleTrack = await this.preloadFirstSubtitleTrackFromLocalCache();
-            }
+                    this.preloadedSubtitleTrack = await this.preloadFirstSubtitleTrackFromLocalCache();
 
             // Handle stdout (should be empty for file output)
             this.process.stdout.on('data', (data) => {
@@ -642,6 +640,26 @@ class TranscodeSession extends EventEmitter {
         }
     }
 
+        stopSourceCacheDownload() {
+            if (!this.sourceCacheProcess) {
+                return;
+            }
+
+            console.log(`[TranscodeSession ${this.id}] Stopping source cache download after subtitle preload`);
+
+            try {
+                this.sourceCacheProcess.kill('SIGTERM');
+            } catch {}
+
+            setTimeout(() => {
+                if (this.sourceCacheProcess) {
+                    try {
+                        this.sourceCacheProcess.kill('SIGKILL');
+                    } catch {}
+                }
+            }, 2000);
+        }
+
     async getSourceCacheInfo() {
         try {
             const stats = await fs.stat(this.sourceCachePath);
@@ -657,7 +675,7 @@ class TranscodeSession extends EventEmitter {
         }
     }
 
-    async preloadFirstSubtitleTrackFromLocalCache(timeoutMs = 15000, minSizeBytes = 300 * 1024 * 1024) {
+    async preloadFirstSubtitleTrackFromLocalCache(timeoutMs = 15000, minSizeBytes = 180 * 1024 * 1024) {
         const subtitleTrack = this.getTextSubtitleTracks()[0];
         if (!subtitleTrack) {
             console.log(`[TranscodeSession ${this.id}] No text subtitle track available for local-cache preload`);
@@ -721,10 +739,20 @@ class TranscodeSession extends EventEmitter {
 
                     try {
                         const content = await fs.readFile(subtitlePath, 'utf8');
-                        if (content && content.includes('WEBVTT')) {
+                        const normalized = content ? content.trim() : '';
+
+                        if (
+                            normalized &&
+                            normalized.includes('WEBVTT') &&
+                            normalized.length > 20 &&
+                            /-->/.test(normalized)
+                        ) {
                             console.log(
                                 `[TranscodeSession ${this.id}] Local-cache subtitle preload succeeded (length=${content.length})`
                             );
+
+                            this.stopSourceCacheDownload();
+
                             return {
                                 index: 0,
                                 streamIndex: subtitleTrack.streamIndex,
@@ -734,6 +762,10 @@ class TranscodeSession extends EventEmitter {
                                 outputName: 'sub_0.vtt'
                             };
                         }
+
+                        console.log(
+                            `[TranscodeSession ${this.id}] Local-cache subtitle preload produced incomplete subtitle output (length=${normalized.length})`
+                        );
                     } catch {}
                 } catch (err) {
                     console.error(

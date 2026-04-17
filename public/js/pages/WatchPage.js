@@ -87,6 +87,7 @@ class WatchPage {
         this.audioMenuOpen = false;
         this.isLoadingVideo = false;
         this.currentLoadRequestId = 0;
+        this.currentPlaybackToken = 0;
         this.currentSubtitleTracks = [];
         this.activeSubtitleIndex = -1;
 
@@ -629,12 +630,14 @@ class WatchPage {
     /**
      * Play HLS stream using Hls.js
      */
-    playHls(url) {
-        if (this.hls) {
-            this.hls.destroy();
-        }
+        playHls(url, playbackToken = this.currentPlaybackToken) {
+            if (this.hls) {
+                this.hls.destroy();
+            }
 
-        this.hls = new Hls({
+            const token = playbackToken;
+
+            this.hls = new Hls({
             maxBufferLength: 30,
             maxMaxBufferLength: 60,
             startLevel: -1,
@@ -645,28 +648,35 @@ class WatchPage {
         this.hls.attachMedia(this.video);
 
         this.hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Audio tracks updated:', data.audioTracks || this.hls.audioTracks);
             this.updateAudioTracks();
         });
 
         this.hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Audio track switched:', data);
             this.updateAudioTracks();
         });
 
         // Listen for subtitle track updates
         this.hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Subtitle tracks updated:', data.subtitleTracks);
-            // Wait a moment for native text tracks to populate
-            setTimeout(() => this.updateCaptionsTracks(), 100);
+            setTimeout(() => {
+                if (token !== this.currentPlaybackToken) return;
+                this.updateCaptionsTracks();
+            }, 100);
         });
 
         this.hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Subtitle track switched:', data);
         });
 
 
         this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] MANIFEST_PARSED audioTracks:', this.hls.audioTracks);
 
             if (this.video?.audioTracks) {
@@ -681,14 +691,21 @@ class WatchPage {
 
             this.updateAudioTracks();
             this.clearSidecarSubtitleTracks();
-            setTimeout(() => this.updateCaptionsTracks(), 300);
+
+            setTimeout(() => {
+                if (token !== this.currentPlaybackToken) return;
+                this.updateCaptionsTracks();
+            }, 300);
 
             this.video.play().catch(e => {
-                if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+                if (e.name !== 'AbortError' && token === this.currentPlaybackToken) {
+                    console.error('[WatchPage] Autoplay error:', e);
+                }
             });
         });
 
         this.hls.on(Hls.Events.ERROR, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             if (data.fatal) {
                 console.error('[WatchPage] HLS fatal error:', data);
                 // Try proxy on CORS error (only if not already proxied/transcoded)
@@ -767,6 +784,8 @@ class WatchPage {
     }
 
     stop() {
+        this.currentPlaybackToken++;
+
         // Stop history tracking and save final progress
         this.stopHistoryTracking();
         this.saveProgress();
