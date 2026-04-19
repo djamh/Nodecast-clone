@@ -91,16 +91,14 @@ router.post('/session', async (req, res) => {
             return res.status(500).json({ error: 'Transcoding failed to start', reason: 'Playlist not generated in time' });
         }
 
-        const subtitleTracks = session.preloadedSubtitleTrack
-            ? [{
-                index: session.preloadedSubtitleTrack.index,
-                streamIndex: session.preloadedSubtitleTrack.streamIndex,
-                language: session.preloadedSubtitleTrack.language || 'und',
-                codec: session.preloadedSubtitleTrack.codec,
-                label: session.preloadedSubtitleTrack.label || 'UND',
-                url: `/api/transcode/${session.id}/${session.preloadedSubtitleTrack.outputName}`
-            }]
-            : [];
+        const subtitleTracks = (session.preloadedSubtitleTracks || []).map((track) => ({
+            index: track.index,
+            streamIndex: track.streamIndex,
+            language: track.language || 'und',
+            codec: track.codec,
+            label: track.label || 'UND',
+            url: `/api/transcode/${session.id}/${track.outputName}`
+        }));
 
         console.log('[Transcode] Preloaded subtitle tracks:', subtitleTracks);
 

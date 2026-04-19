@@ -66,6 +66,7 @@ class TranscodeSession extends EventEmitter {
         this.sourceCachePath = path.join(this.dir, 'source-cache.mkv');
         this.sourceCacheProcess = null;
         this.subtitleProcesses = [];
+        this.preloadedSubtitleTracks = [];
         this.segments = new Map(); // segment index -> { ready: boolean, path: string }
         this.status = 'pending'; // pending | starting | running | stopped | error
         this.error = null;
@@ -141,6 +142,7 @@ class TranscodeSession extends EventEmitter {
                 }
 
                this.preloadedSubtitleTrack = null;
+               this.preloadedSubtitleTracks = [];
                 const args = this.buildFFmpegArgs();
 
                 console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
@@ -154,7 +156,8 @@ class TranscodeSession extends EventEmitter {
                     this.status = 'running';
                     this.startSourceCacheDownload();
 
-                    this.preloadedSubtitleTrack = await this.preloadFirstSubtitleTrackFromLocalCache();
+                    this.preloadedSubtitleTracks = await this.preloadSubtitleTracksFromLocalCache();
+                    this.preloadedSubtitleTrack = this.preloadedSubtitleTracks[0] || null;
 
             // Handle stdout (should be empty for file output)
             this.process.stdout.on('data', (data) => {
@@ -780,6 +783,136 @@ class TranscodeSession extends EventEmitter {
 
         console.log(`[TranscodeSession ${this.id}] Local-cache subtitle preload did not complete in time`);
         return null;
+    }
+
+    async preloadSubtitleTracksFromLocalCache(timeoutMs = 30000, minSizeBytes = 150 * 1024 * 1024) {
+        const subtitleTracks = this.getTextSubtitleTracks();
+
+        if (!subtitleTracks.length) {
+            console.log(`[TranscodeSession ${this.id}] No text subtitle tracks available for local-cache preload`);
+            return [];
+        }
+
+        const start = Date.now();
+        const readyTracks = [];
+        const completedIndexes = new Set();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Trying multi-subtitle preload from local cache at ${cacheInfo.size} bytes`
+                );
+
+                for (let i = 0; i < subtitleTracks.length; i++) {
+                    if (completedIndexes.has(i)) continue;
+
+                    const subtitleTrack = subtitleTracks[i];
+                    const outputName = `sub_${i}.vtt`;
+                    const subtitlePath = path.join(this.dir, outputName);
+
+                    try {
+                        await fs.rm(subtitlePath, { force: true });
+                    } catch {}
+
+                    const args = [
+                        '-hide_banner',
+                        '-loglevel', 'warning',
+                        '-i', this.sourceCachePath,
+                        '-map', `0:${subtitleTrack.streamIndex}`,
+                        '-c:s', 'webvtt',
+                        '-f', 'webvtt',
+                        subtitlePath
+                    ];
+
+                    try {
+                        await new Promise((resolve) => {
+                            const proc = spawn(this.options.ffmpegPath, args, {
+                                cwd: this.dir,
+                                windowsHide: true
+                            });
+
+                            let settled = false;
+                            const finish = () => {
+                                if (settled) return;
+                                settled = true;
+                                resolve();
+                            };
+
+                            proc.stderr.on('data', (data) => {
+                                const msg = data.toString().trim();
+                                if (msg) {
+                                    console.log(`[FFmpeg subtitle local-cache ${this.id}] ${msg}`);
+                                }
+                            });
+
+                            proc.on('error', finish);
+                            proc.on('exit', finish);
+
+                            setTimeout(() => {
+                                try { proc.kill('SIGKILL'); } catch {}
+                                finish();
+                            }, 8000);
+                        });
+
+                        try {
+                            const content = await fs.readFile(subtitlePath, 'utf8');
+                            const normalized = content ? content.trim() : '';
+
+                            if (
+                                normalized &&
+                                normalized.includes('WEBVTT') &&
+                                normalized.length > 20 &&
+                                /-->/.test(normalized)
+                            ) {
+                                readyTracks.push({
+                                    index: i,
+                                    streamIndex: subtitleTrack.streamIndex,
+                                    language: subtitleTrack.language || 'und',
+                                    codec: subtitleTrack.codec,
+                                    label: (subtitleTrack.language || 'und').toUpperCase(),
+                                    outputName
+                                });
+
+                                completedIndexes.add(i);
+
+                                console.log(
+                                    `[TranscodeSession ${this.id}] Local-cache subtitle preload succeeded for ${outputName} (length=${content.length})`
+                                );
+                            } else {
+                                console.log(
+                                    `[TranscodeSession ${this.id}] Local-cache subtitle preload produced incomplete output for ${outputName} (length=${normalized.length})`
+                                );
+                            }
+                        } catch {}
+                    } catch (err) {
+                        console.error(
+                            `[TranscodeSession ${this.id}] Local-cache subtitle preload failed for ${outputName}:`,
+                            err
+                        );
+                    }
+                }
+
+                if (readyTracks.length === subtitleTracks.length) {
+                    this.stopSourceCacheDownload();
+                    return readyTracks;
+                }
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        if (readyTracks.length > 0) {
+            console.log(
+                `[TranscodeSession ${this.id}] Multi-subtitle preload timed out, returning partial results (${readyTracks.length}/${subtitleTracks.length})`
+            );
+            this.stopSourceCacheDownload();
+            return readyTracks;
+        }
+
+        console.log(`[TranscodeSession ${this.id}] Multi-subtitle local-cache preload did not complete in time`);
+        return [];
     }
 
     /*Check if the method to use multiple audio is needed*/ 
