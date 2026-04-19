@@ -66,6 +66,7 @@ class TranscodeSession extends EventEmitter {
         this.sourceCachePath = path.join(this.dir, 'source-cache.mkv');
         this.sourceCacheProcess = null;
         this.subtitleProcesses = [];
+        this.subtitleExtractionPromises = new Map();
         this.preloadedSubtitleTracks = [];
         this.segments = new Map(); // segment index -> { ready: boolean, path: string }
         this.status = 'pending'; // pending | starting | running | stopped | error
@@ -200,7 +201,7 @@ class TranscodeSession extends EventEmitter {
 
                     this.startSourceCacheDownload();
 
-                    const firstTrack = await this.preloadFirstSubtitleTrackFromLocalCache();
+                    const firstTrack = await this.preloadFirstSubtitleTrackFromLocalCache(45000, 120 * 1024 * 1024);
                     this.preloadedSubtitleTrack = firstTrack || null;
                     this.preloadedSubtitleTracks = firstTrack ? [firstTrack] : [];
 
@@ -342,11 +343,14 @@ class TranscodeSession extends EventEmitter {
                     '-hide_banner',
                     '-loglevel', 'warning',
                     '-user_agent', this.options.userAgent,
-                    '-probesize', '5000000',
-                    '-analyzeduration', '5000000',
+                    '-probesize', '32M',
+                    '-analyzeduration', '8M',
                     '-reconnect', '1',
+                    '-reconnect_at_eof', '1',
                     '-reconnect_streamed', '1',
-                    '-reconnect_delay_max', '3',
+                    '-reconnect_on_network_error', '1',
+                    '-reconnect_on_http_error', '4xx,5xx',
+                    '-reconnect_delay_max', '2',
                     '-i', this.url,
                     '-map', `0:${subtitleTrack.streamIndex}`,
                     '-c:s', 'webvtt',
@@ -405,43 +409,76 @@ class TranscodeSession extends EventEmitter {
 
     const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
 
-    try {
-        await fs.access(subtitlePath);
+    const waitForExistingSubtitle = async (timeoutMs = 4000) => {
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const content = await fs.readFile(subtitlePath, 'utf8');
+                const normalized = content ? content.trim() : '';
+
+                if (
+                    normalized &&
+                    normalized.includes('WEBVTT') &&
+                    /-->/.test(normalized) &&
+                    normalized.length > 20
+                ) {
+                    return true;
+                }
+            } catch {}
+
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+
+        return false;
+    };
+
+    if (await waitForExistingSubtitle(4000)) {
         return true;
-    } catch {}
+    }
 
-    const cacheInfo = await this.getSourceCacheInfo();
-    const useLocalCache = cacheInfo.exists && cacheInfo.size >= 150 * 1024 * 1024;
+    const existingExtraction = this.subtitleExtractionPromises.get(subtitleFileName);
+    if (existingExtraction) {
+        return existingExtraction;
+    }
 
-    return new Promise((resolve) => {
-        const args = useLocalCache
-            ? [
-                '-hide_banner',
-                '-loglevel', 'warning',
-                '-i', this.sourceCachePath,
-                '-map', `0:${subtitleTrack.streamIndex}`,
-                '-c:s', 'webvtt',
-                '-f', 'webvtt',
-                subtitlePath
-            ]
-            : [
-                '-hide_banner',
-                '-loglevel', 'warning',
-                '-user_agent', this.options.userAgent,
-                '-probesize', '5000000',
-                '-analyzeduration', '5000000',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '3',
-                '-i', this.url,
-                '-map', `0:${subtitleTrack.streamIndex}`,
-                '-c:s', 'webvtt',
-                '-f', 'webvtt',
-                subtitlePath
-            ];
+    const waitForLocalCache = async (timeoutMs = 45000, minSizeBytes = 120 * 1024 * 1024) => {
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                return true;
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        return false;
+    };
+
+    const hasLocalCache = await waitForLocalCache(45000, 120 * 1024 * 1024);
+
+    const extractionPromise = new Promise((resolve) => {
+        if (!hasLocalCache) {
+            console.log(
+                `[TranscodeSession ${this.id}] Subtitle extraction timed out waiting for local cache: ${subtitleTrack.outputName}`
+            );
+            return resolve(false);
+        }
+
+        const args = [
+            '-y',
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-i', this.sourceCachePath,
+            '-map', `0:${subtitleTrack.streamIndex}`,
+            '-c:s', 'webvtt',
+            '-f', 'webvtt',
+            subtitlePath
+        ];
 
         console.log(
-            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=${useLocalCache ? 'local-cache' : 'remote'}`
+            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=local-cache`
         );
 
         let settled = false;
@@ -485,10 +522,18 @@ class TranscodeSession extends EventEmitter {
             );
             finish(false);
         }
-    });
-}
+      });
 
-    async preloadFirstSubtitleTrack(timeoutMs = 12000) {
+            this.subtitleExtractionPromises.set(subtitleFileName, extractionPromise);
+
+            extractionPromise.finally(() => {
+                this.subtitleExtractionPromises.delete(subtitleFileName);
+            });
+
+            return extractionPromise;
+        }
+
+    async preloadFirstSubtitleTrack(timeoutMs = 20000) {
         const subtitleTrack = this.getTextSubtitleTracks()[0];
         if (!subtitleTrack) {
             console.log(`[TranscodeSession ${this.id}] No text subtitle track available for preload`);
@@ -503,14 +548,18 @@ class TranscodeSession extends EventEmitter {
 
         return new Promise((resolve) => {
             const args = [
+                '-y',
                 '-hide_banner',
                 '-loglevel', 'warning',
                 '-user_agent', this.options.userAgent,
-                '-probesize', '5000000',
-                '-analyzeduration', '5000000',
+                '-probesize', '32M',
+                '-analyzeduration', '8M',
                 '-reconnect', '1',
+                '-reconnect_at_eof', '1',
                 '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '3',
+                '-reconnect_on_network_error', '1',
+                '-reconnect_on_http_error', '4xx,5xx',
+                '-reconnect_delay_max', '2',
                 '-i', this.url,
                 '-map', `0:${subtitleTrack.streamIndex}`,
                 '-c:s', 'webvtt',
@@ -999,13 +1048,16 @@ class TranscodeSession extends EventEmitter {
 
         // Input options (common)
         args.push(
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
+            '-probesize', '32M',
+            '-analyzeduration', '8M',
             '-fflags', '+genpts+discardcorrupt',
             '-err_detect', 'ignore_err',
             '-reconnect', '1',
+            '-reconnect_at_eof', '1',
             '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '3'
+            '-reconnect_on_network_error', '1',
+            '-reconnect_on_http_error', '4xx,5xx',
+            '-reconnect_delay_max', '2'
         );
 
         args.push('-i', this.url);
@@ -1401,6 +1453,12 @@ class TranscodeSession extends EventEmitter {
                 }
             }, 2000);
         }
+
+        fs.rm(this.sourceCachePath, { force: true })
+            .then(() => {
+                console.log(`[TranscodeSession ${this.id}] Removed source cache file`);
+            })
+            .catch(() => {});
 
         for (const proc of this.subtitleProcesses) {
             try {
