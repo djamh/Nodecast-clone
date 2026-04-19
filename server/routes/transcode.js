@@ -12,11 +12,13 @@ async function waitForValidVtt(filePath, timeoutMs = 15000) {
     while (Date.now() - start < timeoutMs) {
         try {
             const content = await fs.readFile(filePath, 'utf8');
+            const normalized = content ? content.trim() : '';
 
             if (
-                content &&
-                content.trim().length > 0 &&
-                content.includes('WEBVTT')
+                normalized &&
+                normalized.includes('WEBVTT') &&
+                /-->/.test(normalized) &&
+                normalized.length > 20
             ) {
                 return true;
             }
@@ -91,12 +93,13 @@ router.post('/session', async (req, res) => {
             return res.status(500).json({ error: 'Transcoding failed to start', reason: 'Playlist not generated in time' });
         }
 
-        const subtitleTracks = (session.preloadedSubtitleTracks || []).map((track) => ({
-            index: track.index,
+        const subtitleTracks = (session.getSidecarSubtitleTracks ? session.getSidecarSubtitleTracks() : []).map((track, index) => ({
+            index,
             streamIndex: track.streamIndex,
             language: track.language || 'und',
             codec: track.codec,
-            label: track.label || 'UND',
+            label: (track.language || 'und').toUpperCase(),
+            outputName: track.outputName,
             url: `/api/transcode/${session.id}/${track.outputName}`
         }));
 
@@ -184,15 +187,65 @@ router.get('/:sessionId/:segment(.+\\.ts)', async (req, res) => {
             return res.status(404).json({ error: 'Session not found' });
         }
 
-        const subtitlePath = await session.getSegment(subtitle);
-        if (!subtitlePath) {
-            return res.status(404).json({ error: 'Subtitle file not found' });
+        let subtitlePath = await session.getSegment(subtitle);
+
+        let shouldRefresh = false;
+
+       if (!subtitlePath) {
+            shouldRefresh = true;
+        } else {
+            try {
+                const [content, stats] = await Promise.all([
+                    fs.readFile(subtitlePath, 'utf8'),
+                    fs.stat(subtitlePath)
+                ]);
+
+                const normalized = content ? content.trim() : '';
+                const ageMs = Date.now() - stats.mtimeMs;
+
+                if (
+                    !normalized ||
+                    !normalized.includes('WEBVTT') ||
+                    !/-->/.test(normalized) ||
+                    normalized.length < 200 ||
+                    ageMs > 90000
+                ) {
+                    shouldRefresh = true;
+                }
+            } catch {
+                shouldRefresh = true;
+            }
         }
 
-        console.log(`[Transcode] Serving preloaded subtitle file: ${subtitle}`);
+        if (shouldRefresh) {
+            console.log(`[Transcode] Subtitle file missing or incomplete, refreshing: ${subtitle}`);
+
+            try {
+                if (subtitlePath) {
+                    await fs.rm(subtitlePath, { force: true });
+                }
+            } catch {}
+
+            const ready = await session.ensureSidecarSubtitleReady(subtitle);
+            if (!ready) {
+                return res.status(404).json({ error: 'Subtitle file not ready' });
+            }
+
+            subtitlePath = await session.getSegment(subtitle);
+            if (!subtitlePath) {
+                return res.status(404).json({ error: 'Subtitle file not found after refresh' });
+            }
+
+            const valid = await waitForValidVtt(subtitlePath, 15000);
+            if (!valid) {
+                return res.status(404).json({ error: 'Subtitle file invalid after refresh' });
+            }
+        }
+
+        console.log(`[Transcode] Serving subtitle file: ${subtitle}`);
 
         res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.sendFile(subtitlePath);
     });
 

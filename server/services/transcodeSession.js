@@ -154,53 +154,55 @@ class TranscodeSession extends EventEmitter {
                     });
 
                     this.status = 'running';
-                    this.startSourceCacheDownload();
 
-                    this.preloadedSubtitleTracks = await this.preloadSubtitleTracksFromLocalCache();
-                    this.preloadedSubtitleTrack = this.preloadedSubtitleTracks[0] || null;
+                    // Handle stdout (should be empty for file output)
+                    this.process.stdout.on('data', (data) => {
+                        console.log(`[TranscodeSession ${this.id}] stdout: ${data}`);
+                    });
 
-            // Handle stdout (should be empty for file output)
-            this.process.stdout.on('data', (data) => {
-                console.log(`[TranscodeSession ${this.id}] stdout: ${data}`);
-            });
-
-            // Handle stderr (FFmpeg progress/errors)
-            let stderrBuffer = '';
-            this.process.stderr.on('data', (data) => {
-                stderrBuffer += data.toString();
-                // Log periodically to avoid spam
-                const lines = stderrBuffer.split('\n');
-                if (lines.length > 1) {
-                    lines.slice(0, -1).forEach(line => {
-                        if (line.trim()) {
-                            console.log(`[FFmpeg ${this.id}] ${line}`);
+                    // Handle stderr (FFmpeg progress/errors)
+                    let stderrBuffer = '';
+                    this.process.stderr.on('data', (data) => {
+                        stderrBuffer += data.toString();
+                        // Log periodically to avoid spam
+                        const lines = stderrBuffer.split('\n');
+                        if (lines.length > 1) {
+                            lines.slice(0, -1).forEach(line => {
+                                if (line.trim()) {
+                                    console.log(`[FFmpeg ${this.id}] ${line}`);
+                                }
+                            });
+                            stderrBuffer = lines[lines.length - 1];
                         }
                     });
-                    stderrBuffer = lines[lines.length - 1];
-                }
-            });
 
-            // Handle process exit
-            this.process.on('exit', (code) => {
-                if (code === 0 || code === null) {
-                    console.log(`[TranscodeSession ${this.id}] FFmpeg completed successfully`);
-                    this.status = 'stopped';
-                } else if (code !== 255) { // 255 is often from SIGKILL
-                    console.error(`[TranscodeSession ${this.id}] FFmpeg exited with code ${code}`);
-                    this.status = 'error';
-                    this.error = `FFmpeg exited with code ${code}`;
-                }
-                this.process = null;
-                this.emit('exit', code);
-            });
+                    // Handle process exit
+                    this.process.on('exit', (code) => {
+                        if (code === 0 || code === null) {
+                            console.log(`[TranscodeSession ${this.id}] FFmpeg completed successfully`);
+                            this.status = 'stopped';
+                        } else if (code !== 255) { // 255 is often from SIGKILL
+                            console.error(`[TranscodeSession ${this.id}] FFmpeg exited with code ${code}`);
+                            this.status = 'error';
+                            this.error = `FFmpeg exited with code ${code}`;
+                        }
+                        this.process = null;
+                        this.emit('exit', code);
+                    });
 
-            // Handle spawn errors
-            this.process.on('error', (err) => {
-                console.error(`[TranscodeSession ${this.id}] FFmpeg error:`, err);
-                this.status = 'error';
-                this.error = err.message;
-                this.emit('error', err);
-            });
+                    // Handle spawn errors
+                    this.process.on('error', (err) => {
+                        console.error(`[TranscodeSession ${this.id}] FFmpeg error:`, err);
+                        this.status = 'error';
+                        this.error = err.message;
+                        this.emit('error', err);
+                    });
+
+                    this.startSourceCacheDownload();
+
+                    const firstTrack = await this.preloadFirstSubtitleTrackFromLocalCache();
+                    this.preloadedSubtitleTrack = firstTrack || null;
+                    this.preloadedSubtitleTracks = firstTrack ? [firstTrack] : [];
 
             // Save session metadata
             await this.persist();
@@ -393,23 +395,36 @@ class TranscodeSession extends EventEmitter {
         }
 
     async ensureSidecarSubtitleReady(subtitleFileName) {
-        const subtitleTrack = this.getSidecarSubtitleTracks().find(
-            (track) => track.outputName === subtitleFileName
-        );
+    const subtitleTrack = this.getSidecarSubtitleTracks().find(
+        (track) => track.outputName === subtitleFileName
+    );
 
-        if (!subtitleTrack) {
-            return false;
-        }
+    if (!subtitleTrack) {
+        return false;
+    }
 
-        const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
+    const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
 
-        try {
-            await fs.access(subtitlePath);
-            return true;
-        } catch {}
+    try {
+        await fs.access(subtitlePath);
+        return true;
+    } catch {}
 
-        return new Promise((resolve) => {
-            const args = [
+    const cacheInfo = await this.getSourceCacheInfo();
+    const useLocalCache = cacheInfo.exists && cacheInfo.size >= 150 * 1024 * 1024;
+
+    return new Promise((resolve) => {
+        const args = useLocalCache
+            ? [
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-i', this.sourceCachePath,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                subtitlePath
+            ]
+            : [
                 '-hide_banner',
                 '-loglevel', 'warning',
                 '-user_agent', this.options.userAgent,
@@ -425,53 +440,53 @@ class TranscodeSession extends EventEmitter {
                 subtitlePath
             ];
 
-            console.log(
-                `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}`
-            );
+        console.log(
+            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=${useLocalCache ? 'local-cache' : 'remote'}`
+        );
 
-            let settled = false;
-            const finish = async (ok) => {
-                if (settled) return;
-                settled = true;
+        let settled = false;
+        const finish = async (ok) => {
+            if (settled) return;
+            settled = true;
 
-                if (ok) {
-                    try {
-                        await fs.access(subtitlePath);
-                        return resolve(true);
-                    } catch {}
-                }
-
-                resolve(false);
-            };
-
-            try {
-                const proc = spawn(this.options.ffmpegPath, args, {
-                    cwd: this.dir,
-                    windowsHide: true
-                });
-
-                proc.stderr.on('data', (data) => {
-                    const msg = data.toString().trim();
-                    if (msg) {
-                        console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
-                    }
-                });
-
-                proc.on('error', () => finish(false));
-                proc.on('exit', async (code) => {
-                    finish(code === 0 || code === null);
-                });
-
-                setTimeout(() => finish(false), 20000);
-            } catch (err) {
-                console.error(
-                    `[TranscodeSession ${this.id}] Failed to extract subtitle on demand for ${subtitleTrack.outputName}:`,
-                    err
-                );
-                finish(false);
+            if (ok) {
+                try {
+                    await fs.access(subtitlePath);
+                    return resolve(true);
+                } catch {}
             }
-        });
-    }
+
+            resolve(false);
+        };
+
+        try {
+            const proc = spawn(this.options.ffmpegPath, args, {
+                cwd: this.dir,
+                windowsHide: true
+            });
+
+            proc.stderr.on('data', (data) => {
+                const msg = data.toString().trim();
+                if (msg) {
+                    console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
+                }
+            });
+
+            proc.on('error', () => finish(false));
+            proc.on('exit', (code) => {
+                finish(code === 0 || code === null);
+            });
+
+            setTimeout(() => finish(false), 45000);
+        } catch (err) {
+            console.error(
+                `[TranscodeSession ${this.id}] Failed to extract subtitle on demand for ${subtitleTrack.outputName}:`,
+                err
+            );
+            finish(false);
+        }
+    });
+}
 
     async preloadFirstSubtitleTrack(timeoutMs = 12000) {
         const subtitleTrack = this.getTextSubtitleTracks()[0];
@@ -615,9 +630,9 @@ class TranscodeSession extends EventEmitter {
                 }
             });
 
-            proc.on('exit', (code) => {
+            proc.on('exit', (code, signal) => {
                 console.log(
-                    `[TranscodeSession ${this.id}] Source cache download exited with code ${code}`
+                    `[TranscodeSession ${this.id}] Source cache download exited with code=${code} signal=${signal}`
                 );
                 if (this.sourceCacheProcess === proc) {
                     this.sourceCacheProcess = null;
@@ -753,8 +768,6 @@ class TranscodeSession extends EventEmitter {
                             console.log(
                                 `[TranscodeSession ${this.id}] Local-cache subtitle preload succeeded (length=${content.length})`
                             );
-
-                            this.stopSourceCacheDownload();
 
                             return {
                                 index: 0,
@@ -895,7 +908,6 @@ class TranscodeSession extends EventEmitter {
                 }
 
                 if (readyTracks.length === subtitleTracks.length) {
-                    this.stopSourceCacheDownload();
                     return readyTracks;
                 }
             }
@@ -907,7 +919,6 @@ class TranscodeSession extends EventEmitter {
             console.log(
                 `[TranscodeSession ${this.id}] Multi-subtitle preload timed out, returning partial results (${readyTracks.length}/${subtitleTracks.length})`
             );
-            this.stopSourceCacheDownload();
             return readyTracks;
         }
 
@@ -1222,15 +1233,20 @@ class TranscodeSession extends EventEmitter {
             '480p': 480
         };
 
-        // When upscaling is enabled, use the upscale target resolution
         if (this.options.upscaleEnabled) {
             const target = resolutionMap[this.options.upscaleTarget] || 1080;
             console.log(`[TranscodeSession ${this.id}] Upscale target height: ${target}p`);
             return target;
         }
 
-        // Otherwise, use max resolution as the cap
-        return resolutionMap[this.options.maxResolution] || 1080;
+        let target = resolutionMap[this.options.maxResolution] || 1080;
+
+        if (this.options.hwEncoder === 'amf' && target > 1080) {
+            console.log(`[TranscodeSession ${this.id}] Capping AMF target height to 1080p for compatibility`);
+            target = 1080;
+        }
+
+        return target;
     }
 
     /**

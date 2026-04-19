@@ -90,6 +90,7 @@ class WatchPage {
         this.currentPlaybackToken = 0;
         this.currentSubtitleTracks = [];
         this.activeSubtitleIndex = -1;
+        this.subtitleRefreshInterval = null;
 
         // Overlay timer
         this.overlayTimeout = null;
@@ -742,7 +743,7 @@ class WatchPage {
         trackEl.kind = 'subtitles';
         trackEl.label = subtitleTrack.label || (subtitleTrack.language || 'und').toUpperCase();
         trackEl.srclang = subtitleTrack.language || 'und';
-        trackEl.src = subtitleTrack.url;
+        trackEl.src = `${subtitleTrack.url}${subtitleTrack.url.includes('?') ? '&' : '?'}v=${Date.now()}`;
         trackEl.default = false;
         trackEl.setAttribute('data-sidecar-subtitle', 'true');
 
@@ -783,8 +784,32 @@ class WatchPage {
 
     }
 
+    startSubtitleRefreshLoop() {
+            this.stopSubtitleRefreshLoop();
+
+            this.subtitleRefreshInterval = setInterval(() => {
+                if (!this.video) return;
+                if (this.activeSubtitleIndex < 0) return;
+                if (!Array.isArray(this.currentSubtitleTracks)) return;
+
+                const subtitleTrack = this.currentSubtitleTracks[this.activeSubtitleIndex];
+                if (!subtitleTrack) return;
+
+                console.log('[WatchPage] Refreshing active subtitle track:', subtitleTrack);
+                this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
+            }, 90000);
+        }
+
+        stopSubtitleRefreshLoop() {
+            if (this.subtitleRefreshInterval) {
+                clearInterval(this.subtitleRefreshInterval);
+                this.subtitleRefreshInterval = null;
+            }
+        }
+
     stop() {
         this.currentPlaybackToken++;
+        this.stopSubtitleRefreshLoop();
 
         // Stop history tracking and save final progress
         this.stopHistoryTracking();
@@ -1204,6 +1229,7 @@ class WatchPage {
             if (index < 0) {
                 this.activeSubtitleIndex = -1;
                 this.hls.subtitleTrack = -1;
+                this.stopSubtitleRefreshLoop();
                 this.updateCaptionsTracks();
                 this.closeCaptionsMenu();
                 return;
@@ -1235,6 +1261,7 @@ class WatchPage {
 
         if (index < 0) {
             this.activeSubtitleIndex = -1;
+            this.stopSubtitleRefreshLoop();
             this.clearSidecarSubtitleTracks();
             this.updateCaptionsTracks();
             this.closeCaptionsMenu();
@@ -1253,6 +1280,7 @@ class WatchPage {
         this.activeSubtitleIndex = index;
         console.log('[WatchPage] Attaching selected subtitle track:', subtitleTrack);
         this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
+        this.startSubtitleRefreshLoop();
         this.updateCaptionsTracks();
         this.closeCaptionsMenu();
     }
