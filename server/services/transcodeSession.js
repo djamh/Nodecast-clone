@@ -1295,7 +1295,7 @@ class TranscodeSession extends EventEmitter {
 
         if (this.options.hwEncoder === 'amf' && target > 1080) {
             console.log(`[TranscodeSession ${this.id}] Capping AMF target height to 1080p for compatibility`);
-            target = 1080;
+            target = 1440;
         }
 
         return target;
