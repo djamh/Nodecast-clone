@@ -795,54 +795,64 @@ class WatchPage {
     }
 
     attachSelectedSidecarSubtitleTrack(subtitleTrack) {
-        if (!this.video || !subtitleTrack) return;
+    if (!this.video || !subtitleTrack) return;
 
-        this.clearSidecarSubtitleTracks();
+    const existingTracks = Array.from(
+        this.video.querySelectorAll('track[data-sidecar-subtitle="true"]')
+    );
 
-        const trackEl = document.createElement('track');
-        trackEl.kind = 'subtitles';
-        trackEl.label = subtitleTrack.label || (subtitleTrack.language || 'und').toUpperCase();
-        trackEl.srclang = subtitleTrack.language || 'und';
-        trackEl.src = `${subtitleTrack.url}${subtitleTrack.url.includes('?') ? '&' : '?'}v=${Date.now()}`;
-        trackEl.default = false;
-        trackEl.setAttribute('data-sidecar-subtitle', 'true');
+    const trackEl = document.createElement('track');
+    trackEl.kind = 'subtitles';
+    trackEl.label = subtitleTrack.label || (subtitleTrack.language || 'und').toUpperCase();
+    trackEl.srclang = subtitleTrack.language || 'und';
+    trackEl.src = `${subtitleTrack.url}${subtitleTrack.url.includes('?') ? '&' : '?'}v=${Date.now()}`;
+    trackEl.default = false;
+    trackEl.setAttribute('data-sidecar-subtitle', 'true');
+    trackEl.setAttribute('data-sidecar-pending', 'true');
 
-        trackEl.addEventListener('load', () => {
-            console.log('[WatchPage] Sidecar subtitle loaded:', trackEl.src);
+    const activateTrack = () => {
+        const textTracks = this.video.textTracks;
 
-            const textTracks = this.video.textTracks;
-            for (let i = 0; i < textTracks.length; i++) {
-                if (textTracks[i].kind === 'subtitles' || textTracks[i].kind === 'captions') {
-                    textTracks[i].mode = 'disabled';
-                }
+        for (let i = 0; i < textTracks.length; i++) {
+            if (textTracks[i].kind === 'subtitles' || textTracks[i].kind === 'captions') {
+                textTracks[i].mode = 'disabled';
             }
+        }
 
-            const latestTrack = textTracks[textTracks.length - 1];
-            if (latestTrack && (latestTrack.kind === 'subtitles' || latestTrack.kind === 'captions')) {
-                latestTrack.mode = 'showing';
-            }
+        const currentTextTrack = trackEl.track || textTracks[textTracks.length - 1];
+        if (currentTextTrack && (currentTextTrack.kind === 'subtitles' || currentTextTrack.kind === 'captions')) {
+            currentTextTrack.mode = 'showing';
+        }
 
-            this.updateCaptionsTracks();
+        // Only remove old sidecar tracks after the new one is really loaded
+        existingTracks.forEach(track => {
+            if (track !== trackEl) track.remove();
         });
 
-        trackEl.addEventListener('error', () => {
-            console.warn('[WatchPage] Sidecar subtitle failed to load:', trackEl.src);
-            this.updateCaptionsTracks();
-        });
+        trackEl.removeAttribute('data-sidecar-pending');
+        this.updateCaptionsTracks();
+    };
 
-        this.video.appendChild(trackEl);
+    trackEl.addEventListener('load', () => {
+        console.log('[WatchPage] Sidecar subtitle loaded:', trackEl.src);
+        activateTrack();
+    });
 
-        setTimeout(() => {
-            const textTracks = this.video.textTracks;
-            const latestTrack = textTracks[textTracks.length - 1];
+    trackEl.addEventListener('error', () => {
+        console.warn('[WatchPage] Sidecar subtitle failed to load:', trackEl.src);
+        trackEl.remove();
+        this.updateCaptionsTracks();
+    });
 
-            if (latestTrack && (latestTrack.kind === 'subtitles' || latestTrack.kind === 'captions')) {
-                console.log('[WatchPage] Forcing subtitle track activation for fetch:', subtitleTrack.url);
-                latestTrack.mode = 'hidden';
-            }
-        }, 0);
+    this.video.appendChild(trackEl);
 
+    // Force the browser to fetch the track, but do not leave it hidden if it loads fast
+    const pendingTextTrack = trackEl.track;
+    if (pendingTextTrack && (pendingTextTrack.kind === 'subtitles' || pendingTextTrack.kind === 'captions')) {
+        console.log('[WatchPage] Forcing subtitle track activation for fetch:', subtitleTrack.url);
+        pendingTextTrack.mode = 'hidden';
     }
+}
 
     startSubtitleRefreshLoop() {
             this.stopSubtitleRefreshLoop();
@@ -857,7 +867,7 @@ class WatchPage {
 
                 console.log('[WatchPage] Refreshing active subtitle track:', subtitleTrack);
                 this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
-            }, 90000);
+            }, 15000);
         }
 
         stopSubtitleRefreshLoop() {

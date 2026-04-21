@@ -199,7 +199,7 @@ class TranscodeSession extends EventEmitter {
                         this.emit('error', err);
                     });
 
-                        if (!this.options.fastSeek) {
+                         if (!this.options.fastSeek) {
                         this.startSourceCacheDownload();
 
                         // Do not block playback startup on subtitle preload.
@@ -362,20 +362,27 @@ class TranscodeSession extends EventEmitter {
                     '-hide_banner',
                     '-loglevel', 'warning',
                     '-user_agent', this.options.userAgent,
-                    '-probesize', '32M',
-                    '-analyzeduration', '8M',
+                    '-probesize', this.options.fastSeek ? '4M' : '32M',
+                    '-analyzeduration', this.options.fastSeek ? '1M' : '8M',
                     '-reconnect', '1',
                     '-reconnect_at_eof', '1',
                     '-reconnect_streamed', '1',
                     '-reconnect_on_network_error', '1',
                     '-reconnect_on_http_error', '4xx,5xx',
-                    '-reconnect_delay_max', '2',
+                    '-reconnect_delay_max', this.options.fastSeek ? '1' : '2'
+                ];
+
+                if (this.options.fastSeek && this.options.seekOffset > 0) {
+                    args.push('-ss', String(this.options.seekOffset));
+                }
+
+                args.push(
                     '-i', this.url,
                     '-map', `0:${subtitleTrack.streamIndex}`,
                     '-c:s', 'webvtt',
                     '-f', 'webvtt',
                     subtitlePath
-                ];
+                );
 
                 console.log(
                     `[TranscodeSession ${this.id}] Starting sidecar subtitle extraction: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}`
@@ -461,49 +468,105 @@ class TranscodeSession extends EventEmitter {
         return existingExtraction;
     }
 
-    const waitForLocalCache = async (timeoutMs = 45000, minSizeBytes = 120 * 1024 * 1024) => {
-        const start = Date.now();
+    const extractionPromise = new Promise(async (resolve) => {
+        let args;
+        let sourceLabel;
 
-        while (Date.now() - start < timeoutMs) {
-            const cacheInfo = await this.getSourceCacheInfo();
-            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
-                return true;
+        if (this.options.fastSeek) {
+            const waitForTempLocalCache = async (timeoutMs = 30000, minSizeBytes = 120 * 1024 * 1024) => {
+                if (!this.sourceCacheProcess) {
+                    this.startSourceCacheDownload();
+                }
+
+                const start = Date.now();
+
+                while (Date.now() - start < timeoutMs) {
+                    const cacheInfo = await this.getSourceCacheInfo();
+                    if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                        return true;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+
+                return false;
+            };
+
+            const hasTempLocalCache = await waitForTempLocalCache(15000, 25 * 1024 * 1024);
+
+            if (!hasTempLocalCache) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Fast-seek subtitle extraction could not get enough local cache: ${subtitleTrack.outputName}`
+                );
+                return resolve(false);
             }
-            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            args = [
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-i', this.sourceCachePath,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                subtitlePath
+            ];
+
+            sourceLabel = 'temp-local-cache';
+        } else {
+            const waitForLocalCache = async (timeoutMs = 45000, minSizeBytes = 120 * 1024 * 1024) => {
+                const start = Date.now();
+
+                while (Date.now() - start < timeoutMs) {
+                    const cacheInfo = await this.getSourceCacheInfo();
+                    if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                        return true;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+
+                return false;
+            };
+
+            const hasLocalCache = await waitForLocalCache(45000, 120 * 1024 * 1024);
+
+            if (!hasLocalCache) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Subtitle extraction timed out waiting for local cache: ${subtitleTrack.outputName}`
+                );
+                return resolve(false);
+            }
+
+            args = [
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-i', this.sourceCachePath,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                subtitlePath
+            ];
+
+            sourceLabel = 'local-cache';
         }
-
-        return false;
-    };
-
-    const hasLocalCache = await waitForLocalCache(45000, 120 * 1024 * 1024);
-
-    const extractionPromise = new Promise((resolve) => {
-        if (!hasLocalCache) {
-            console.log(
-                `[TranscodeSession ${this.id}] Subtitle extraction timed out waiting for local cache: ${subtitleTrack.outputName}`
-            );
-            return resolve(false);
-        }
-
-        const args = [
-            '-y',
-            '-hide_banner',
-            '-loglevel', 'warning',
-            '-i', this.sourceCachePath,
-            '-map', `0:${subtitleTrack.streamIndex}`,
-            '-c:s', 'webvtt',
-            '-f', 'webvtt',
-            subtitlePath
-        ];
 
         console.log(
-            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=local-cache`
+            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=${sourceLabel}`
         );
 
         let settled = false;
+        let procRef = null;
+
         const finish = async (ok) => {
             if (settled) return;
             settled = true;
+
+            if (!ok && procRef) {
+                try { procRef.kill('SIGTERM'); } catch {}
+                setTimeout(() => {
+                    try { procRef.kill('SIGKILL'); } catch {}
+                }, 1000);
+            }
 
             if (ok) {
                 try {
@@ -520,6 +583,7 @@ class TranscodeSession extends EventEmitter {
                 cwd: this.dir,
                 windowsHide: true
             });
+            procRef = proc;
 
             proc.stderr.on('data', (data) => {
                 const msg = data.toString().trim();
@@ -533,7 +597,7 @@ class TranscodeSession extends EventEmitter {
                 finish(code === 0 || code === null);
             });
 
-            setTimeout(() => finish(false), 45000);
+            setTimeout(() => finish(false), this.options.fastSeek ? 30000 : 45000);
         } catch (err) {
             console.error(
                 `[TranscodeSession ${this.id}] Failed to extract subtitle on demand for ${subtitleTrack.outputName}:`,
@@ -650,25 +714,35 @@ class TranscodeSession extends EventEmitter {
     }
 
     startSourceCacheDownload() {
-        if (this.sourceCacheProcess) {
-            return;
-        }
+    if (this.sourceCacheProcess) {
+        return;
+    }
 
-        const args = [
-            '-hide_banner',
-            '-loglevel', 'warning',
-            '-user_agent', this.options.userAgent,
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '3',
-            '-i', this.url,
-            '-map', '0',
-            '-c', 'copy',
-            '-f', 'matroska',
-            this.sourceCachePath
-        ];
+    const args = [
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-user_agent', this.options.userAgent,
+        '-probesize', '5000000',
+        '-analyzeduration', '5000000',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '3'
+    ];
+
+    if (this.options.fastSeek && this.options.seekOffset > 0) {
+        console.log(
+            `[TranscodeSession ${this.id}] Starting source cache download from fast-seek offset ${this.options.seekOffset}s`
+        );
+        args.push('-ss', String(this.options.seekOffset));
+    }
+
+    args.push(
+        '-i', this.url,
+        '-map', '0',
+        '-c', 'copy',
+        '-f', 'matroska',
+        this.sourceCachePath
+    );
 
         console.log(
             `[TranscodeSession ${this.id}] Starting local source cache download: ${this.sourceCachePath}`
