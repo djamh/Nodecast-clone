@@ -343,6 +343,15 @@ class MoviesPage {
             if (result && result.url) {
                 // Play in dedicated Watch page
                 if (this.app.pages.watch) {
+                    console.log('[MoviesPage] Duration debug:', {
+                        name: movie.name,
+                        duration: movie.duration,
+                        duration_secs: movie.duration_secs,
+                        durationSeconds: movie.durationSeconds,
+                        movie_duration: movie.movie_duration,
+                        runtime: movie.runtime,
+                        fullMovieObject: movie
+                    });
                     this.app.pages.watch.play({
                         type: 'movie',
                         id: movie.stream_id,
@@ -353,7 +362,9 @@ class MoviesPage {
                         rating: movie.rating,
                         sourceId: movie.sourceId,
                         categoryId: movie.category_id,
-                        containerExtension: container
+                        containerExtension: container,
+                        duration: movie.duration || movie.duration_secs || movie.durationSeconds || movie.movie_duration || movie.runtime || '',
+                        durationSeconds: movie.duration_secs || movie.durationSeconds || 0
                     }, result.url);
                 }
             }

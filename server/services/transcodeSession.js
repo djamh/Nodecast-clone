@@ -199,14 +199,33 @@ class TranscodeSession extends EventEmitter {
                         this.emit('error', err);
                     });
 
-                    this.startSourceCacheDownload();
+                        if (!this.options.fastSeek) {
+                        this.startSourceCacheDownload();
 
-                    const firstTrack = await this.preloadFirstSubtitleTrackFromLocalCache(45000, 120 * 1024 * 1024);
-                    this.preloadedSubtitleTrack = firstTrack || null;
-                    this.preloadedSubtitleTracks = firstTrack ? [firstTrack] : [];
+                        // Do not block playback startup on subtitle preload.
+                        // Keep subtitle metadata available, but let the session become usable immediately.
+                        this.preloadedSubtitleTrack = null;
+                        this.preloadedSubtitleTracks = [];
 
-            // Save session metadata
-            await this.persist();
+                        this.preloadFirstSubtitleTrackFromLocalCache(45000, 120 * 1024 * 1024)
+                            .then((firstTrack) => {
+                                this.preloadedSubtitleTrack = firstTrack || null;
+                                this.preloadedSubtitleTracks = firstTrack ? [firstTrack] : [];
+                            })
+                            .catch((err) => {
+                                console.warn(
+                                    `[TranscodeSession ${this.id}] Background subtitle preload failed:`,
+                                    err?.message || err
+                                );
+                            });
+                    } else {
+                        console.log(`[TranscodeSession ${this.id}] Fast-seek session: skipping source-cache startup`);
+                        this.preloadedSubtitleTrack = null;
+                        this.preloadedSubtitleTracks = [];
+                    }
+
+                    // Save session metadata
+                    await this.persist();
 
         } catch (err) {
             this.status = 'error';
@@ -1046,10 +1065,20 @@ class TranscodeSession extends EventEmitter {
             this.addHwAccelInputArgs(args, encoder);
         }
 
-        // Input options (common)
+        const inputProbeSize = this.options.fastSeek ? '4M' : '32M';
+        const inputAnalyzeDuration = this.options.fastSeek ? '1M' : '8M';
+        const reconnectDelayMax = this.options.fastSeek ? '1' : '2';
+
+        if (this.options.fastSeek) {
+            console.log(
+                `[TranscodeSession ${this.id}] Fast-seek session: using lighter probe settings (${inputProbeSize}, ${inputAnalyzeDuration})`
+            );
+        }
+
+        // Input options
         args.push(
-            '-probesize', '32M',
-            '-analyzeduration', '8M',
+            '-probesize', inputProbeSize,
+            '-analyzeduration', inputAnalyzeDuration,
             '-fflags', '+genpts+discardcorrupt',
             '-err_detect', 'ignore_err',
             '-reconnect', '1',
@@ -1057,13 +1086,20 @@ class TranscodeSession extends EventEmitter {
             '-reconnect_streamed', '1',
             '-reconnect_on_network_error', '1',
             '-reconnect_on_http_error', '4xx,5xx',
-            '-reconnect_delay_max', '2'
+            '-reconnect_delay_max', reconnectDelayMax
         );
+
+        if (this.options.seekOffset > 0 && this.options.fastSeek) {
+            console.log(
+                `[TranscodeSession ${this.id}] Using fast input seek at ${this.options.seekOffset}s`
+            );
+            args.push('-ss', String(this.options.seekOffset));
+        }
 
         args.push('-i', this.url);
 
-        // Add seek offset if specified (as output option to avoid Range requests)
-        if (this.options.seekOffset > 0) {
+        // Default path: output-side seek
+        if (this.options.seekOffset > 0 && !this.options.fastSeek) {
             args.push('-ss', String(this.options.seekOffset));
         }
 

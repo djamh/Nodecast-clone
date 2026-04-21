@@ -91,6 +91,11 @@ class WatchPage {
         this.currentSubtitleTracks = [];
         this.activeSubtitleIndex = -1;
         this.subtitleRefreshInterval = null;
+        this.currentTranscodeOptions = null;
+        this.pendingSeekPercent = null;
+        this.isSeekPreviewing = false;
+        this.fullDuration = 0;
+        this.sessionTimeOffset = 0;
 
         // Overlay timer
         this.overlayTimeout = null;
@@ -192,7 +197,18 @@ class WatchPage {
         });
 
         // Progress bar
-        this.progressSlider?.addEventListener('input', (e) => this.seek(e.target.value));
+        this.progressSlider?.addEventListener('input', (e) => this.previewSeek(e.target.value));
+        this.progressSlider?.addEventListener('change', (e) => this.seek(e.target.value));
+        this.progressSlider?.addEventListener('mouseup', () => {
+            if (this.pendingSeekPercent !== null) {
+                this.seek(this.pendingSeekPercent);
+            }
+        });
+        this.progressSlider?.addEventListener('touchend', () => {
+            if (this.pendingSeekPercent !== null) {
+                this.seek(this.pendingSeekPercent);
+            }
+        });
 
         // Video events
         this.video?.addEventListener('timeupdate', () => this.updateProgress());
@@ -270,6 +286,18 @@ class WatchPage {
      * @param {string} streamUrl - Stream URL
      */
     async play(content, streamUrl) {
+        console.log(
+            '[WatchPage] play() content payload inline:',
+            JSON.stringify({
+                id: content?.id,
+                title: content?.title,
+                duration: content?.duration,
+                durationSeconds: content?.durationSeconds,
+                runtime: content?.runtime,
+                movie_duration: content?.movie_duration,
+                containerExtension: content?.containerExtension
+            })
+        );
         this.content = content;
         this.contentType = content.type;
         this.seriesInfo = content.seriesInfo || null;
@@ -458,6 +486,24 @@ class WatchPage {
         // Reset subtitle state before loading a new source
         this.currentSubtitleTracks = [];
         this.activeSubtitleIndex = -1;
+        this.fullDuration =
+            this.parseDurationToSeconds(this.content?.durationSeconds) ||
+            this.parseDurationToSeconds(this.content?.duration) ||
+            this.parseDurationToSeconds(this.content?.runtime) ||
+            this.parseDurationToSeconds(this.content?.movie_duration) ||
+            0;
+        this.sessionTimeOffset = 0;
+
+            console.log(
+            '[WatchPage] duration parse debug inline:',
+            JSON.stringify({
+                rawDurationSeconds: this.content?.durationSeconds,
+                rawDuration: this.content?.duration,
+                runtime: this.content?.runtime,
+                movie_duration: this.content?.movie_duration,
+                parsedFullDuration: this.fullDuration
+            })
+        );
 
         // Stop any existing playback
         this.stop();
@@ -503,6 +549,10 @@ class WatchPage {
                 this.currentStreamInfo = info;
                 this.updateQualityBadge();
 
+                if (Number(info.duration) > 0) {
+                    this.fullDuration = Number(info.duration);
+                }
+
                 
 
                 if (info.needsTranscode || settings.upscaleEnabled) {
@@ -515,14 +565,16 @@ class WatchPage {
                     const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
 
                     this.updateTranscodeStatus(statusMode, statusText);
-                    const playlistUrl = await this.startTranscodeSession(url, {
+
+                    this.currentTranscodeOptions = {
                         videoMode,
-                       /* seekOffset: this.resumeTime, // Ensure seekOffset is passed*/
                         seekOffset: 0,
                         videoCodec: info.video,
                         audioCodec: info.audio,
                         audioChannels: info.audioChannels
-                    });
+                    };
+
+                    const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
                     this.playHls(playlistUrl);
                     this.setVolumeFromStorage();
                     return;
@@ -532,6 +584,7 @@ class WatchPage {
                     console.log('[WatchPage] Auto: Using remux (.ts container)');
                     this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
                     const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
+                    this.currentTranscodeOptions = null;
                     this.video.src = finalUrl;
                     this.video.play().catch(e => {
                         if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
@@ -553,10 +606,14 @@ class WatchPage {
             const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
             console.log(`[WatchPage] ${statusText} enabled. Starting session (encode)...`);
             this.updateTranscodeStatus(statusMode, statusText);
-            const playlistUrl = await this.startTranscodeSession(url, {
+            this.updateTranscodeStatus(statusMode, statusText);
+
+            this.currentTranscodeOptions = {
                 videoMode: 'encode',
                 seekOffset: this.resumeTime
-            });
+            };
+
+            const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -575,11 +632,13 @@ class WatchPage {
                 videoCodec = info.video;
             } catch (e) { console.warn('Probe failed for force audio, assuming h264'); }
 
-            const playlistUrl = await this.startTranscodeSession(url, {
+            this.currentTranscodeOptions = {
                 videoMode: 'copy',
                 videoCodec,
                 seekOffset: this.resumeTime
-            });
+            };
+
+            const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -606,6 +665,7 @@ class WatchPage {
         console.log('[WatchPage] Playing:', { url, needsProxy, looksLikeHls });
 
         // Use HLS.js for HLS streams
+        this.currentTranscodeOptions = null;
         if (looksLikeHls && Hls.isSupported()) {
             this.updateTranscodeStatus('direct', 'Direct HLS');
             this.playHls(finalUrl);
@@ -851,15 +911,105 @@ class WatchPage {
     }
 
     skip(seconds) {
-        if (this.video) {
-            this.video.currentTime = Math.max(0, Math.min(this.video.currentTime + seconds, this.video.duration || 0));
+        if (!this.video) return;
+
+        const duration = this.fullDuration || this.video.duration || 0;
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const targetTime = Math.max(0, Math.min(effectiveCurrentTime + seconds, duration || effectiveCurrentTime + seconds));
+
+        if (this.currentSessionId && this.currentTranscodeOptions && targetTime < this.sessionTimeOffset) {
+            this.restartTranscodeAt(targetTime);
+            return;
+        }
+
+        const localTargetTime = Math.max(0, targetTime - this.sessionTimeOffset);
+        this.video.currentTime = localTargetTime;
+    }
+
+    previewSeek(percent) {
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!duration) return;
+
+        const numericPercent = Math.max(0, Math.min(100, Number(percent)));
+        this.pendingSeekPercent = numericPercent;
+        this.isSeekPreviewing = true;
+
+        const targetTime = (numericPercent / 100) * duration;
+
+        if (this.progressSlider) {
+            this.progressSlider.value = numericPercent;
+        }
+
+        if (this.timeCurrent) {
+            this.timeCurrent.textContent = this.formatTime(targetTime);
         }
     }
 
-    seek(percent) {
-        if (this.video && this.video.duration) {
-            this.video.currentTime = (percent / 100) * this.video.duration;
+    async restartTranscodeAt(targetTime) {
+        if (!this.currentUrl || !this.currentTranscodeOptions) return;
+
+        const normalizedTarget = Math.max(0, Math.floor(targetTime));
+
+        console.log('[WatchPage] Restarting transcode session at:', normalizedTarget);
+
+        this.showLoading();
+
+        await this.stopTranscodeSession();
+
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
         }
+
+        if (this.video) {
+            this.video.pause();
+            this.video.removeAttribute('src');
+            this.video.load();
+        }
+
+        const seekOptions = {
+            ...this.currentTranscodeOptions,
+            seekOffset: normalizedTarget,
+            fastSeek: true
+        };
+
+        this.sessionTimeOffset = normalizedTarget;
+
+        if (this.timeCurrent) {
+            this.timeCurrent.textContent = this.formatTime(normalizedTarget);
+        }
+
+        const playlistUrl = await this.startTranscodeSession(this.currentUrl, seekOptions);
+        this.playHls(playlistUrl);
+        this.setVolumeFromStorage();
+    }
+
+    async seek(percent) {
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!this.video || !duration) return;
+
+        const numericPercent = Math.max(0, Math.min(100, Number(percent)));
+        const targetTime = (numericPercent / 100) * duration;
+
+        this.pendingSeekPercent = null;
+        this.isSeekPreviewing = false;
+
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const delta = targetTime - effectiveCurrentTime;
+
+        const targetBeforeCurrentSession = targetTime < this.sessionTimeOffset;
+        const shouldRestartSession =
+            !!this.currentSessionId &&
+            !!this.currentTranscodeOptions &&
+            (targetBeforeCurrentSession || delta >= 90);
+
+        if (shouldRestartSession) {
+            await this.restartTranscodeAt(targetTime);
+            return;
+        }
+
+        const localTargetTime = Math.max(0, targetTime - this.sessionTimeOffset);
+        this.video.currentTime = localTargetTime;
     }
 
     toggleMute() {
@@ -964,11 +1114,16 @@ class WatchPage {
     // === UI Updates ===
 
     updateProgress() {
-        if (!this.video || !this.video.duration) return;
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!this.video || !duration) return;
 
-        const percent = (this.video.currentTime / this.video.duration) * 100;
-        this.progressSlider.value = percent;
-        this.timeCurrent.textContent = this.formatTime(this.video.currentTime);
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const percent = (effectiveCurrentTime / duration) * 100;
+
+        if (!this.isSeekPreviewing) {
+            this.progressSlider.value = Math.max(0, Math.min(100, percent));
+            this.timeCurrent.textContent = this.formatTime(effectiveCurrentTime);
+        }
 
         // Show "Up Next" panel early for series (like streaming services do during credits)
         // Only show if auto-play next episode is enabled
@@ -1003,15 +1158,33 @@ class WatchPage {
             this.updateQualityBadge();
         }
 
+        const mediaDuration = this.video?.duration || 0;
+        const usingTranscodeSession = !!this.currentSessionId && !!this.currentTranscodeOptions;
+
+        console.log('[WatchPage] metadata duration debug:', {
+            mediaDuration,
+            fullDuration: this.fullDuration,
+            usingTranscodeSession
+        });
+
+        // Only trust video.duration when we are NOT in a growing HLS transcode session
+        if (!this.fullDuration && mediaDuration && !usingTranscodeSession) {
+            this.fullDuration = mediaDuration;
+        }
+
+        if (this.timeTotal) {
+            this.timeTotal.textContent = this.formatTime(this.fullDuration || mediaDuration || 0);
+        }
+
         // Handle resumption
         if (this.resumeTime > 0 && this.video) {
-            const duration = this.video.duration;
+            const duration = this.fullDuration || mediaDuration;
             // Only resume if not near the end (95%)
             if (!duration || this.resumeTime < duration * 0.95) {
                 console.log(`[WatchPage] Resuming at ${this.resumeTime}s`);
                 this.video.currentTime = this.resumeTime;
             }
-            this.resumeTime = 0; // Reset after use
+            this.resumeTime = 0;
         }
     }
 
@@ -1070,6 +1243,57 @@ class WatchPage {
             return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
         }
         return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    parseDurationToSeconds(value) {
+        if (typeof value === 'number' && isFinite(value) && value > 0) {
+            return value;
+        }
+
+        if (typeof value !== 'string') {
+            return 0;
+        }
+
+        const raw = value.trim();
+        if (!raw) {
+            return 0;
+        }
+
+        if (/^\d+(\.\d+)?$/.test(raw)) {
+            const numeric = Number(raw);
+            return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+        }
+
+        const clockParts = raw.split(':').map(part => part.trim());
+        if (clockParts.length >= 2 && clockParts.length <= 3 && clockParts.every(part => /^\d+$/.test(part))) {
+            let hours = 0;
+            let minutes = 0;
+            let seconds = 0;
+
+            if (clockParts.length === 3) {
+                hours = Number(clockParts[0]);
+                minutes = Number(clockParts[1]);
+                seconds = Number(clockParts[2]);
+            } else {
+                minutes = Number(clockParts[0]);
+                seconds = Number(clockParts[1]);
+            }
+
+            return (hours * 3600) + (minutes * 60) + seconds;
+        }
+
+        const hoursMatch = raw.match(/(\d+)\s*h/i);
+        const minutesMatch = raw.match(/(\d+)\s*m/i);
+        const secondsMatch = raw.match(/(\d+)\s*s/i);
+
+        if (hoursMatch || minutesMatch || secondsMatch) {
+            const hours = hoursMatch ? Number(hoursMatch[1]) : 0;
+            const minutes = minutesMatch ? Number(minutesMatch[1]) : 0;
+            const seconds = secondsMatch ? Number(secondsMatch[1]) : 0;
+            return (hours * 3600) + (minutes * 60) + seconds;
+        }
+
+        return 0;
     }
 
     // === Loading Spinner ===
