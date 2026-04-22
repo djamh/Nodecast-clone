@@ -67,6 +67,7 @@ class TranscodeSession extends EventEmitter {
         this.sourceCacheProcess = null;
         this.subtitleProcesses = [];
         this.subtitleExtractionPromises = new Map();
+        this.subtitleUpgradePromises = new Map();
         this.preloadedSubtitleTracks = [];
         this.segments = new Map(); // segment index -> { ready: boolean, path: string }
         this.status = 'pending'; // pending | starting | running | stopped | error
@@ -219,9 +220,13 @@ class TranscodeSession extends EventEmitter {
                                 );
                             });
                     } else {
-                        console.log(`[TranscodeSession ${this.id}] Fast-seek session: skipping source-cache startup`);
+                        console.log(`[TranscodeSession ${this.id}] Fast-seek session: starting source-cache early for subtitle readiness`);
                         this.preloadedSubtitleTrack = null;
                         this.preloadedSubtitleTracks = [];
+
+                        if (this.getTextSubtitleTracks().length > 0) {
+                            this.startSourceCacheDownload();
+                        }
                     }
 
                     // Save session metadata
@@ -425,196 +430,79 @@ class TranscodeSession extends EventEmitter {
         }
 
     async ensureSidecarSubtitleReady(subtitleFileName) {
-    const subtitleTrack = this.getSidecarSubtitleTracks().find(
-        (track) => track.outputName === subtitleFileName
-    );
-
-    if (!subtitleTrack) {
-        return false;
-    }
-
-    const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
-
-    const waitForExistingSubtitle = async (timeoutMs = 4000) => {
-        const start = Date.now();
-
-        while (Date.now() - start < timeoutMs) {
-            try {
-                const content = await fs.readFile(subtitlePath, 'utf8');
-                const normalized = content ? content.trim() : '';
-
-                if (
-                    normalized &&
-                    normalized.includes('WEBVTT') &&
-                    /-->/.test(normalized) &&
-                    normalized.length > 20
-                ) {
-                    return true;
-                }
-            } catch {}
-
-            await new Promise(resolve => setTimeout(resolve, 250));
-        }
-
-        return false;
-    };
-
-    if (await waitForExistingSubtitle(4000)) {
-        return true;
-    }
-
-    const existingExtraction = this.subtitleExtractionPromises.get(subtitleFileName);
-    if (existingExtraction) {
-        return existingExtraction;
-    }
-
-    const extractionPromise = new Promise(async (resolve) => {
-        let args;
-        let sourceLabel;
-
-        if (this.options.fastSeek) {
-            const waitForTempLocalCache = async (timeoutMs = 30000, minSizeBytes = 120 * 1024 * 1024) => {
-                if (!this.sourceCacheProcess) {
-                    this.startSourceCacheDownload();
-                }
-
-                const start = Date.now();
-
-                while (Date.now() - start < timeoutMs) {
-                    const cacheInfo = await this.getSourceCacheInfo();
-                    if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
-                        return true;
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
-
-                return false;
-            };
-
-            const hasTempLocalCache = await waitForTempLocalCache(15000, 25 * 1024 * 1024);
-
-            if (!hasTempLocalCache) {
-                console.log(
-                    `[TranscodeSession ${this.id}] Fast-seek subtitle extraction could not get enough local cache: ${subtitleTrack.outputName}`
-                );
-                return resolve(false);
-            }
-
-            args = [
-                '-y',
-                '-hide_banner',
-                '-loglevel', 'warning',
-                '-i', this.sourceCachePath,
-                '-map', `0:${subtitleTrack.streamIndex}`,
-                '-c:s', 'webvtt',
-                '-f', 'webvtt',
-                subtitlePath
-            ];
-
-            sourceLabel = 'temp-local-cache';
-        } else {
-            const waitForLocalCache = async (timeoutMs = 45000, minSizeBytes = 120 * 1024 * 1024) => {
-                const start = Date.now();
-
-                while (Date.now() - start < timeoutMs) {
-                    const cacheInfo = await this.getSourceCacheInfo();
-                    if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
-                        return true;
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-
-                return false;
-            };
-
-            const hasLocalCache = await waitForLocalCache(45000, 120 * 1024 * 1024);
-
-            if (!hasLocalCache) {
-                console.log(
-                    `[TranscodeSession ${this.id}] Subtitle extraction timed out waiting for local cache: ${subtitleTrack.outputName}`
-                );
-                return resolve(false);
-            }
-
-            args = [
-                '-y',
-                '-hide_banner',
-                '-loglevel', 'warning',
-                '-i', this.sourceCachePath,
-                '-map', `0:${subtitleTrack.streamIndex}`,
-                '-c:s', 'webvtt',
-                '-f', 'webvtt',
-                subtitlePath
-            ];
-
-            sourceLabel = 'local-cache';
-        }
-
-        console.log(
-            `[TranscodeSession ${this.id}] Extracting subtitle on demand: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}, source=${sourceLabel}`
+        const subtitleTrack = this.getSidecarSubtitleTracks().find(
+            (track) => track.outputName === subtitleFileName
         );
 
-        let settled = false;
-        let procRef = null;
+        if (!subtitleTrack) {
+            return false;
+        }
 
-        const finish = async (ok) => {
-            if (settled) return;
-            settled = true;
+        const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
 
-            if (!ok && procRef) {
-                try { procRef.kill('SIGTERM'); } catch {}
-                setTimeout(() => {
-                    try { procRef.kill('SIGKILL'); } catch {}
-                }, 1000);
-            }
+        const waitForExistingSubtitle = async (timeoutMs = 4000) => {
+            const start = Date.now();
 
-            if (ok) {
+            while (Date.now() - start < timeoutMs) {
                 try {
-                    await fs.access(subtitlePath);
-                    return resolve(true);
+                    const content = await fs.readFile(subtitlePath, 'utf8');
+                    if (this.isUsableSubtitleContent(content, {
+                        minLength: this.options.fastSeek ? 500 : 800,
+                        minCueCount: this.options.fastSeek ? 4 : 6
+                    })) {
+                        return true;
+                    }
                 } catch {}
+
+                await new Promise(resolve => setTimeout(resolve, 250));
             }
 
-            resolve(false);
+            return false;
         };
 
-        try {
-            const proc = spawn(this.options.ffmpegPath, args, {
-                cwd: this.dir,
-                windowsHide: true
-            });
-            procRef = proc;
+        if (await waitForExistingSubtitle(4000)) {
+            return true;
+        }
 
-            proc.stderr.on('data', (data) => {
-                const msg = data.toString().trim();
-                if (msg) {
-                    console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
-                }
-            });
+        const existingExtraction = this.subtitleExtractionPromises.get(subtitleFileName);
+        if (existingExtraction) {
+            return existingExtraction;
+        }
 
-            proc.on('error', () => finish(false));
-            proc.on('exit', (code) => {
-                finish(code === 0 || code === null);
-            });
-
-            setTimeout(() => finish(false), this.options.fastSeek ? 30000 : 45000);
-        } catch (err) {
-            console.error(
-                `[TranscodeSession ${this.id}] Failed to extract subtitle on demand for ${subtitleTrack.outputName}:`,
-                err
+        const extractionPromise = (async () => {
+            console.log(
+                `[TranscodeSession ${this.id}] Building preview subtitle from local cache: ${subtitleTrack.outputName}`
             );
-            finish(false);
-        }
-      });
 
-            this.subtitleExtractionPromises.set(subtitleFileName, extractionPromise);
+            const previewOk = await this.buildPreviewSubtitleWithRetries(subtitleTrack, subtitlePath);
 
-            extractionPromise.finally(() => {
-                this.subtitleExtractionPromises.delete(subtitleFileName);
-            });
+            if (!previewOk) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Preview subtitle could not be built from any cache stage: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
 
-            return extractionPromise;
-        }
+            if (this.options.fastSeek) {
+                this.scheduleSubtitleUpgrade(subtitleTrack).catch((err) => {
+                    console.warn(
+                        `[TranscodeSession ${this.id}] Background subtitle upgrade failed for ${subtitleTrack.outputName}:`,
+                        err?.message || err
+                    );
+                });
+            }
+
+            return true;
+        })();
+
+        this.subtitleExtractionPromises.set(subtitleFileName, extractionPromise);
+
+        extractionPromise.finally(() => {
+            this.subtitleExtractionPromises.delete(subtitleFileName);
+        });
+
+        return extractionPromise;
+    }
 
     async preloadFirstSubtitleTrack(timeoutMs = 20000) {
         const subtitleTrack = this.getTextSubtitleTracks()[0];
@@ -833,6 +721,186 @@ class TranscodeSession extends EventEmitter {
                 size: 0
             };
         }
+    }
+
+    isUsableSubtitleContent(content, options = {}) {
+        const minLength = options.minLength ?? 500;
+        const minCueCount = options.minCueCount ?? 4;
+
+        const normalized = content ? content.trim() : '';
+        if (!normalized || !normalized.includes('WEBVTT')) return false;
+
+        const cueCount = (normalized.match(/-->/g) || []).length;
+        if (cueCount < minCueCount) return false;
+        if (normalized.length < minLength) return false;
+
+        return true;
+    }
+
+    async waitForSourceCache(minSizeBytes, timeoutMs = 30000) {
+        if (!this.sourceCacheProcess) {
+            this.startSourceCacheDownload();
+        }
+
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                return true;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        return false;
+    }
+
+    async extractSubtitleFromCache(subtitleTrack, outputPath, validation = {}) {
+        return new Promise((resolve) => {
+            const args = [
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-i', this.sourceCachePath,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                outputPath
+            ];
+
+            let settled = false;
+
+            const finish = async () => {
+                if (settled) return;
+                settled = true;
+
+                try {
+                    const content = await fs.readFile(outputPath, 'utf8');
+                    resolve(this.isUsableSubtitleContent(content, validation));
+                } catch {
+                    resolve(false);
+                }
+            };
+
+            try {
+                const proc = spawn(this.options.ffmpegPath, args, {
+                    cwd: this.dir,
+                    windowsHide: true
+                });
+
+                proc.stderr.on('data', (data) => {
+                    const msg = data.toString().trim();
+                    if (msg) {
+                        console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
+                    }
+                });
+
+                proc.on('error', finish);
+                proc.on('exit', finish);
+
+                setTimeout(() => {
+                    try { proc.kill('SIGKILL'); } catch {}
+                    finish();
+                }, 12000);
+            } catch {
+                finish();
+            }
+        });
+    }
+
+    async buildPreviewSubtitleWithRetries(subtitleTrack, subtitlePath) {
+        const stages = this.options.fastSeek
+            ? [
+                { cacheSize: 40 * 1024 * 1024, timeoutMs: 5000, minLength: 500, minCueCount: 4, label: '40MB' },
+                { cacheSize: 120 * 1024 * 1024, timeoutMs: 8000, minLength: 700, minCueCount: 5, label: '120MB' },
+                { cacheSize: 240 * 1024 * 1024, timeoutMs: 12000, minLength: 900, minCueCount: 6, label: '240MB' },
+                { cacheSize: 360 * 1024 * 1024, timeoutMs: 18000, minLength: 1200, minCueCount: 8, label: '360MB' }
+            ]
+            : [
+                { cacheSize: 120 * 1024 * 1024, timeoutMs: 15000, minLength: 800, minCueCount: 6, label: '120MB' }
+            ];
+
+        for (const stage of stages) {
+            const ready = await this.waitForSourceCache(stage.cacheSize, stage.timeoutMs);
+            if (!ready) {
+                continue;
+            }
+
+            console.log(
+                `[TranscodeSession ${this.id}] Trying preview subtitle stage ${stage.label} for ${subtitleTrack.outputName}`
+            );
+
+            const ok = await this.extractSubtitleFromCache(subtitleTrack, subtitlePath, {
+                minLength: stage.minLength,
+                minCueCount: stage.minCueCount
+            });
+
+            if (ok) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Preview subtitle ready at stage ${stage.label}: ${subtitleTrack.outputName}`
+                );
+                return true;
+            }
+
+            console.log(
+                `[TranscodeSession ${this.id}] Preview subtitle stage ${stage.label} still too small: ${subtitleTrack.outputName}`
+            );
+        }
+
+        return false;
+    }
+
+    scheduleSubtitleUpgrade(subtitleTrack) {
+        const key = subtitleTrack.outputName;
+
+        if (this.subtitleUpgradePromises.has(key)) {
+            return this.subtitleUpgradePromises.get(key);
+        }
+
+        const promise = (async () => {
+            const stableReady = await this.waitForSourceCache(250 * 1024 * 1024, 60000);
+            if (!stableReady) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Stable subtitle upgrade timed out waiting for cache: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
+
+            const stablePath = path.join(this.dir, `${subtitleTrack.outputName}.stable.vtt`);
+            const publicPath = path.join(this.dir, subtitleTrack.outputName);
+
+            console.log(
+                `[TranscodeSession ${this.id}] Building stable subtitle upgrade for ${subtitleTrack.outputName}`
+            );
+
+            const ok = await this.extractSubtitleFromCache(subtitleTrack, stablePath, {
+                minLength: 1500,
+                minCueCount: 10
+            });
+
+            if (!ok) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Stable subtitle upgrade not usable yet: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
+
+            await fs.copyFile(stablePath, publicPath);
+
+            console.log(
+                `[TranscodeSession ${this.id}] Stable subtitle promoted: ${subtitleTrack.outputName}`
+            );
+
+            return true;
+        })();
+
+        this.subtitleUpgradePromises.set(key, promise);
+
+        promise.finally(() => {
+            this.subtitleUpgradePromises.delete(key);
+        });
+
+        return promise;
     }
 
     async preloadFirstSubtitleTrackFromLocalCache(timeoutMs = 15000, minSizeBytes = 180 * 1024 * 1024) {
