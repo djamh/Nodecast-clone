@@ -278,13 +278,27 @@ class TranscodeSession extends EventEmitter {
                         if (trimmed.includes('Stream #') && trimmed.includes('Subtitle:')) {
                             const match = trimmed.match(/Stream #(\d+):(\d+)(?:\(([^)]+)\))?: Subtitle:\s*([^,]+)/);
                             if (match) {
-                                subtitleTracks.push({
-                                    programIndex: parseInt(match[1], 10),
-                                    streamIndex: parseInt(match[2], 10),
-                                    language: match[3] || 'und',
-                                    codec: match[4].trim().toLowerCase(),
-                                    raw: trimmed
-                                });
+                                const codec = match[4].trim().toLowerCase();
+                                const unsupportedCodecs = new Set([
+                                    'hdmv_pgs_subtitle',
+                                    'pgssub',
+                                    'dvd_subtitle',
+                                    'xsub'
+                                ]);
+
+                                if (!unsupportedCodecs.has(codec)) {
+                                    subtitleTracks.push({
+                                        programIndex: parseInt(match[1], 10),
+                                        streamIndex: parseInt(match[2], 10),
+                                        language: match[3] || 'und',
+                                        codec,
+                                        raw: trimmed
+                                    });
+                                } else {
+                                    console.log(
+                                        `[TranscodeSession ${this.id}] Ignoring unsupported subtitle stream ${match[2]} (${codec}) during probe`
+                                    );
+                                }
                             }
                         }
 
@@ -761,6 +775,8 @@ class TranscodeSession extends EventEmitter {
                 '-y',
                 '-hide_banner',
                 '-loglevel', 'warning',
+                '-probesize', '2M',
+                '-analyzeduration', '0',
                 '-i', this.sourceCachePath,
                 '-map', `0:${subtitleTrack.streamIndex}`,
                 '-c:s', 'webvtt',
