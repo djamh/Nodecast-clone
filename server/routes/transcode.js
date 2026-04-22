@@ -6,6 +6,30 @@ const fs = require('fs').promises;
 const db = require('../db');
 const transcodeSession = require('../services/transcodeSession');
 
+async function waitForValidVtt(filePath, timeoutMs = 15000) {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const content = await fs.readFile(filePath, 'utf8');
+            const normalized = content ? content.trim() : '';
+
+            if (
+                normalized &&
+                normalized.includes('WEBVTT') &&
+                /-->/.test(normalized) &&
+                normalized.length > 20
+            ) {
+                return true;
+            }
+        } catch {}
+
+        await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    return false;
+}
+
 /**
  * Transcode Routes
  * 
@@ -13,11 +37,12 @@ const transcodeSession = require('../services/transcodeSession');
  *   GET /api/transcode?url=...
  * 
  * HLS session-based (new, supports seeking):
- *   POST /api/transcode/session        - Create new session
+ *   POST /api/transcode/session         - Create new session
  *   GET  /api/transcode/:id/stream.m3u8 - Get HLS playlist
  *   GET  /api/transcode/:id/:segment.ts - Get segment file
- *   DELETE /api/transcode/:id          - Stop and cleanup session
- *   GET /api/transcode/sessions        - List all sessions (debug)
+ *   GET  /api/transcode/:id/:file.vtt   - Get sidecar subtitle file
+ *   DELETE /api/transcode/:id           - Stop and cleanup session
+ *   GET  /api/transcode/sessions        - List all sessions (debug)
  */
 
 // Start session cleanup interval
@@ -29,7 +54,7 @@ transcodeSession.startCleanupInterval();
  * Body: { url: string, seekOffset?: number }
  */
 router.post('/session', async (req, res) => {
-    const { url, seekOffset, videoMode, videoCodec, audioCodec, audioChannels } = req.body;
+    const { url, seekOffset, fastSeek, videoMode, videoCodec, audioCodec, audioChannels } = req.body;
 
     if (!url) {
         return res.status(400).json({ error: 'URL is required' });
@@ -44,6 +69,7 @@ router.post('/session', async (req, res) => {
             ffmpegPath,
             userAgent,
             seekOffset: seekOffset || 0,
+            fastSeek: !!fastSeek,
             hwEncoder: settings.hwEncoder || 'software',
             maxResolution: settings.maxResolution || '1080p',
             quality: settings.quality || 'medium',
@@ -61,17 +87,30 @@ router.post('/session', async (req, res) => {
         await session.start();
 
         // Wait for playlist to be ready (first segments generated)
-        const ready = await session.waitForPlaylist(15000);
+        const ready = await session.waitForPlaylist(60000);
 
         if (!ready) {
             await transcodeSession.removeSession(session.id);
             return res.status(500).json({ error: 'Transcoding failed to start', reason: 'Playlist not generated in time' });
         }
 
+        const subtitleTracks = (session.getSidecarSubtitleTracks ? session.getSidecarSubtitleTracks() : []).map((track, index) => ({
+            index,
+            streamIndex: track.streamIndex,
+            language: track.language || 'und',
+            codec: track.codec,
+            label: (track.language || 'und').toUpperCase(),
+            outputName: track.outputName,
+            url: `/api/transcode/${session.id}/${track.outputName}`
+        }));
+
+        console.log('[Transcode] Preloaded subtitle tracks:', subtitleTracks);
+
         res.json({
             sessionId: session.id,
             playlistUrl: `/api/transcode/${session.id}/stream.m3u8`,
-            status: session.status
+            status: session.status,
+            subtitleTracks
         });
 
     } catch (err) {
@@ -84,29 +123,33 @@ router.post('/session', async (req, res) => {
  * Get HLS playlist for a session
  * GET /api/transcode/:sessionId/stream.m3u8
  */
-router.get('/:sessionId/stream.m3u8', async (req, res) => {
-    const { sessionId } = req.params;
+router.get('/:sessionId/:playlist(.+\\.m3u8)', async (req, res) => {
+    const { sessionId, playlist } = req.params;
     const session = transcodeSession.getSession(sessionId);
 
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
 
-    const playlist = await session.getPlaylist();
-    if (!playlist) {
+    if (!playlist.endsWith('.m3u8')) {
+        return res.status(404).json({ error: 'Invalid playlist' });
+    }
+
+    const playlistContent = await session.getPlaylist(playlist);
+    if (!playlistContent) {
         return res.status(404).json({ error: 'Playlist not ready' });
     }
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
-    res.send(playlist);
+    res.send(playlistContent);
 });
 
 /**
  * Get a segment file for a session
  * GET /api/transcode/:sessionId/:segment.ts
  */
-router.get('/:sessionId/:segment', async (req, res) => {
+router.get('/:sessionId/:segment(.+\\.ts)', async (req, res) => {
     const { sessionId, segment } = req.params;
 
     // Only handle .ts files
@@ -128,6 +171,84 @@ router.get('/:sessionId/:segment', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache forever (immutable)
     res.sendFile(segmentPath);
 });
+
+/**
+ * Get a generated subtitle file for a session
+ * GET /api/transcode/:sessionId/:file.vtt
+ */
+    router.get('/:sessionId/:subtitle(.+\\.vtt)', async (req, res) => {
+        const { sessionId, subtitle } = req.params;
+
+        if (!subtitle.endsWith('.vtt')) {
+            return res.status(404).json({ error: 'Invalid subtitle file' });
+        }
+
+        const session = transcodeSession.getSession(sessionId);
+        if (!session) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+
+        let subtitlePath = await session.getSegment(subtitle);
+
+        let shouldRefresh = false;
+
+       if (!subtitlePath) {
+            shouldRefresh = true;
+        } else {
+            try {
+                const [content, stats] = await Promise.all([
+                    fs.readFile(subtitlePath, 'utf8'),
+                    fs.stat(subtitlePath)
+                ]);
+
+                const normalized = content ? content.trim() : '';
+                const ageMs = Date.now() - stats.mtimeMs;
+
+                if (
+                    !normalized ||
+                    !normalized.includes('WEBVTT') ||
+                    !/-->/.test(normalized) ||
+                    normalized.length < 200 ||
+                    ageMs > 90000
+                ) {
+                    shouldRefresh = true;
+                }
+            } catch {
+                shouldRefresh = true;
+            }
+        }
+
+        if (shouldRefresh) {
+            console.log(`[Transcode] Subtitle file missing or incomplete, refreshing: ${subtitle}`);
+
+            try {
+                if (subtitlePath) {
+                    await fs.rm(subtitlePath, { force: true });
+                }
+            } catch {}
+
+            const ready = await session.ensureSidecarSubtitleReady(subtitle);
+            if (!ready) {
+                return res.status(404).json({ error: 'Subtitle file not ready' });
+            }
+
+            subtitlePath = await session.getSegment(subtitle);
+            if (!subtitlePath) {
+                return res.status(404).json({ error: 'Subtitle file not found after refresh' });
+            }
+
+            const valid = await waitForValidVtt(subtitlePath, 15000);
+            if (!valid) {
+                return res.status(404).json({ error: 'Subtitle file invalid after refresh' });
+            }
+        }
+
+        console.log(`[Transcode] Serving subtitle file: ${subtitle}`);
+
+        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.sendFile(subtitlePath);
+    });
 
 /**
  * Stop and cleanup a session
@@ -200,7 +321,7 @@ router.get('/', async (req, res) => {
         '-i', url,
         // Map only first video and audio stream (avoid subtitle streams causing issues)
         '-map', '0:v:0',
-        '-map', '0:a:0?', // ? makes audio optional if not present
+        '-map', '0:a?', // ? makes audio optional if not present
         // Video: passthrough (no re-encoding = fast!)
         '-c:v', 'copy',
         // Audio: Transcode to browser-compatible AAC

@@ -125,11 +125,17 @@ function analyzeProbeResult(probeResult, url) {
 
     const compatible = !needsTranscode && !needsRemux;
 
+    const parsedDuration = Number(format.duration);
+    const duration = Number.isFinite(parsedDuration) && parsedDuration > 0
+        ? parsedDuration
+        : 0;
+
     return {
         video: videoCodec,
         audio: audioCodec,
         width: videoStream?.width || 0,
         height: videoStream?.height || 0,
+        duration: duration,
         audioChannels: audioStream?.channels || 0, // For Smart Audio Copy
         container: container,
         compatible: compatible,
@@ -178,7 +184,7 @@ router.get('/', async (req, res) => {
         probeCache.set(cacheKey, { result: analysis, timestamp: Date.now() });
 
         console.log(`[Probe] Result: video=${analysis.video}, audio=${analysis.audio}, ` +
-            `container=${analysis.container}, compatible=${analysis.compatible}, ` +
+            `container=${analysis.container}, duration=${analysis.duration}, compatible=${analysis.compatible}, ` +
             `needsRemux=${analysis.needsRemux}, needsTranscode=${analysis.needsTranscode}`);
 
         res.json(analysis);

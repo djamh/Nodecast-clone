@@ -59,7 +59,16 @@ class TranscodeSession extends EventEmitter {
         this.url = url;
         this.dir = path.join(CACHE_DIR, this.id);
         this.playlistPath = path.join(this.dir, 'stream.m3u8');
+        this.variantPlaylistPattern = path.join(this.dir, '%v.m3u8');
+        this.segmentFilenamePattern = path.join(this.dir, '%v_seg_%04d.ts');
+        this.inputStreamInfo = null;
         this.process = null;
+        this.sourceCachePath = path.join(this.dir, 'source-cache.mkv');
+        this.sourceCacheProcess = null;
+        this.subtitleProcesses = [];
+        this.subtitleExtractionPromises = new Map();
+        this.subtitleUpgradePromises = new Map();
+        this.preloadedSubtitleTracks = [];
         this.segments = new Map(); // segment index -> { ready: boolean, path: string }
         this.status = 'pending'; // pending | starting | running | stopped | error
         this.error = null;
@@ -100,64 +109,128 @@ class TranscodeSession extends EventEmitter {
             throw err;
         }
 
+        
         // Build FFmpeg arguments for HLS output
-        const args = this.buildFFmpegArgs();
 
-        console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
+        /*calling the method to create the list of audio output*/ 
+                try {
+                    this.inputStreamInfo = await this.probeInputStreams();
 
-        try {
-            this.process = spawn(this.options.ffmpegPath, args, {
-                cwd: this.dir,
-                windowsHide: true
-            });
+                    const audioCount = this.inputStreamInfo?.audioTracks?.length || 0;
+                    const subtitleCount = this.inputStreamInfo?.subtitleTracks?.length || 0;
 
-            this.status = 'running';
+                    console.log(
+                        `[TranscodeSession ${this.id}] Input probe: ${audioCount} audio track(s), ${subtitleCount} subtitle track(s)`
+                    );
 
-            // Handle stdout (should be empty for file output)
-            this.process.stdout.on('data', (data) => {
-                console.log(`[TranscodeSession ${this.id}] stdout: ${data}`);
-            });
+                    if (audioCount > 0) {
+                        this.inputStreamInfo.audioTracks.forEach((track, i) => {
+                            console.log(
+                                `[TranscodeSession ${this.id}] Audio track ${i}: stream=${track.streamIndex}, lang=${track.language}`
+                            );
+                        });
+                    }
 
-            // Handle stderr (FFmpeg progress/errors)
-            let stderrBuffer = '';
-            this.process.stderr.on('data', (data) => {
-                stderrBuffer += data.toString();
-                // Log periodically to avoid spam
-                const lines = stderrBuffer.split('\n');
-                if (lines.length > 1) {
-                    lines.slice(0, -1).forEach(line => {
-                        if (line.trim()) {
-                            console.log(`[FFmpeg ${this.id}] ${line}`);
+                    if (subtitleCount > 0) {
+                        this.inputStreamInfo.subtitleTracks.forEach((track, i) => {
+                            console.log(
+                                `[TranscodeSession ${this.id}] Subtitle track ${i}: stream=${track.streamIndex}, lang=${track.language}, codec=${track.codec}`
+                            );
+                        });
+                    }
+                } catch (err) {
+                    console.warn(`[TranscodeSession ${this.id}] Input stream probe failed:`, err.message);
+                    this.inputStreamInfo = { audioTracks: [], subtitleTracks: [] };
+                }
+
+               this.preloadedSubtitleTrack = null;
+               this.preloadedSubtitleTracks = [];
+                const args = this.buildFFmpegArgs();
+
+                console.log(`[TranscodeSession ${this.id}] Command: ${this.options.ffmpegPath} ${args.join(' ')}`);
+
+                try {
+                    this.process = spawn(this.options.ffmpegPath, args, {
+                        cwd: this.dir,
+                        windowsHide: true
+                    });
+
+                    this.status = 'running';
+
+                    // Handle stdout (should be empty for file output)
+                    this.process.stdout.on('data', (data) => {
+                        console.log(`[TranscodeSession ${this.id}] stdout: ${data}`);
+                    });
+
+                    // Handle stderr (FFmpeg progress/errors)
+                    let stderrBuffer = '';
+                    this.process.stderr.on('data', (data) => {
+                        stderrBuffer += data.toString();
+                        // Log periodically to avoid spam
+                        const lines = stderrBuffer.split('\n');
+                        if (lines.length > 1) {
+                            lines.slice(0, -1).forEach(line => {
+                                if (line.trim()) {
+                                    console.log(`[FFmpeg ${this.id}] ${line}`);
+                                }
+                            });
+                            stderrBuffer = lines[lines.length - 1];
                         }
                     });
-                    stderrBuffer = lines[lines.length - 1];
-                }
-            });
 
-            // Handle process exit
-            this.process.on('exit', (code) => {
-                if (code === 0 || code === null) {
-                    console.log(`[TranscodeSession ${this.id}] FFmpeg completed successfully`);
-                    this.status = 'stopped';
-                } else if (code !== 255) { // 255 is often from SIGKILL
-                    console.error(`[TranscodeSession ${this.id}] FFmpeg exited with code ${code}`);
-                    this.status = 'error';
-                    this.error = `FFmpeg exited with code ${code}`;
-                }
-                this.process = null;
-                this.emit('exit', code);
-            });
+                    // Handle process exit
+                    this.process.on('exit', (code) => {
+                        if (code === 0 || code === null) {
+                            console.log(`[TranscodeSession ${this.id}] FFmpeg completed successfully`);
+                            this.status = 'stopped';
+                        } else if (code !== 255) { // 255 is often from SIGKILL
+                            console.error(`[TranscodeSession ${this.id}] FFmpeg exited with code ${code}`);
+                            this.status = 'error';
+                            this.error = `FFmpeg exited with code ${code}`;
+                        }
+                        this.process = null;
+                        this.emit('exit', code);
+                    });
 
-            // Handle spawn errors
-            this.process.on('error', (err) => {
-                console.error(`[TranscodeSession ${this.id}] FFmpeg error:`, err);
-                this.status = 'error';
-                this.error = err.message;
-                this.emit('error', err);
-            });
+                    // Handle spawn errors
+                    this.process.on('error', (err) => {
+                        console.error(`[TranscodeSession ${this.id}] FFmpeg error:`, err);
+                        this.status = 'error';
+                        this.error = err.message;
+                        this.emit('error', err);
+                    });
 
-            // Save session metadata
-            await this.persist();
+                         if (!this.options.fastSeek) {
+                        this.startSourceCacheDownload();
+
+                        // Do not block playback startup on subtitle preload.
+                        // Keep subtitle metadata available, but let the session become usable immediately.
+                        this.preloadedSubtitleTrack = null;
+                        this.preloadedSubtitleTracks = [];
+
+                        this.preloadFirstSubtitleTrackFromLocalCache(45000, 120 * 1024 * 1024)
+                            .then((firstTrack) => {
+                                this.preloadedSubtitleTrack = firstTrack || null;
+                                this.preloadedSubtitleTracks = firstTrack ? [firstTrack] : [];
+                            })
+                            .catch((err) => {
+                                console.warn(
+                                    `[TranscodeSession ${this.id}] Background subtitle preload failed:`,
+                                    err?.message || err
+                                );
+                            });
+                    } else {
+                        console.log(`[TranscodeSession ${this.id}] Fast-seek session: starting source-cache early for subtitle readiness`);
+                        this.preloadedSubtitleTrack = null;
+                        this.preloadedSubtitleTracks = [];
+
+                        if (this.getTextSubtitleTracks().length > 0) {
+                            this.startSourceCacheDownload();
+                        }
+                    }
+
+                    // Save session metadata
+                    await this.persist();
 
         } catch (err) {
             this.status = 'error';
@@ -166,19 +239,971 @@ class TranscodeSession extends EventEmitter {
         }
     }
 
+    
+    async probeInputStreams() {
+        const ffmpegPath = this.options.ffmpegPath || 'ffmpeg';
+
+        return new Promise((resolve) => {
+            const args = [
+                '-hide_banner',
+                '-loglevel', 'info',
+                '-user_agent', this.options.userAgent,
+                '-probesize', '5000000',
+                '-analyzeduration', '5000000',
+                '-i', this.url,
+                '-f', 'null',
+                '-'
+            ];
+
+
+
+            /*Prepare to have a master playlist in the session*/ 
+                const proc = spawn(ffmpegPath, args, { windowsHide: true });
+
+                let stderr = '';
+                let settled = false;
+
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
+
+                    const lines = stderr.split('\n');
+
+                    const audioTracks = [];
+                    const subtitleTracks = [];
+
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+
+                        if (trimmed.includes('Stream #') && trimmed.includes('Subtitle:')) {
+                            const match = trimmed.match(/Stream #(\d+):(\d+)(?:\(([^)]+)\))?: Subtitle:\s*([^,]+)/);
+                            if (match) {
+                                const codec = match[4].trim().toLowerCase();
+                                const unsupportedCodecs = new Set([
+                                    'hdmv_pgs_subtitle',
+                                    'pgssub',
+                                    'dvd_subtitle',
+                                    'xsub'
+                                ]);
+
+                                if (!unsupportedCodecs.has(codec)) {
+                                    subtitleTracks.push({
+                                        programIndex: parseInt(match[1], 10),
+                                        streamIndex: parseInt(match[2], 10),
+                                        language: match[3] || 'und',
+                                        codec,
+                                        raw: trimmed
+                                    });
+                                } else {
+                                    console.log(
+                                        `[TranscodeSession ${this.id}] Ignoring unsupported subtitle stream ${match[2]} (${codec}) during probe`
+                                    );
+                                }
+                            }
+                        }
+
+                        if (trimmed.includes('Stream #') && trimmed.includes('Audio:')) {
+                            const match = trimmed.match(/Stream #(\d+):(\d+)(?:\(([^)]+)\))?: Audio:/);
+                            if (match) {
+                                audioTracks.push({
+                                    programIndex: parseInt(match[1], 10),
+                                    streamIndex: parseInt(match[2], 10),
+                                    language: match[3] || 'und',
+                                    raw: trimmed
+                                });
+                            }
+                        }
+                    }
+
+                    const uniqueAudioTracks = [];
+                    const seenAudio = new Set();
+
+                    for (const track of audioTracks) {
+                        const key = `${track.programIndex}:${track.streamIndex}`;
+                        if (!seenAudio.has(key)) {
+                            seenAudio.add(key);
+                            uniqueAudioTracks.push(track);
+                        }
+                    }
+
+                    const uniqueSubtitleTracks = [];
+                    const seenSubtitles = new Set();
+
+                    for (const track of subtitleTracks) {
+                        const key = `${track.programIndex}:${track.streamIndex}`;
+                        if (!seenSubtitles.has(key)) {
+                            seenSubtitles.add(key);
+                            uniqueSubtitleTracks.push(track);
+                        }
+                    }
+
+                    resolve({
+                        audioTracks: uniqueAudioTracks,
+                        subtitleTracks: uniqueSubtitleTracks
+                    });
+
+                };
+
+                proc.stderr.on('data', (data) => {
+                    stderr += data.toString();
+
+                    // Once FFmpeg has printed stream info, we can stop early
+                    if (stderr.includes('Stream #')) {
+                        setTimeout(() => {
+                            try { proc.kill('SIGKILL'); } catch {}
+                            finish();
+                        }, 500);
+                    }
+                });
+
+                proc.on('error', () => finish());
+                proc.on('exit', () => finish());
+
+                setTimeout(() => {
+                    try { proc.kill('SIGKILL'); } catch {}
+                    finish();
+                }, 8000);
+            });
+        }
+
+    async startSidecarSubtitleExtractions() {
+            const sidecarSubtitleTracks = this.getSidecarSubtitleTracks();
+
+            if (!sidecarSubtitleTracks.length) {
+                console.log(`[TranscodeSession ${this.id}] No sidecar subtitle tracks to extract`);
+                return;
+            }
+
+            for (const subtitleTrack of sidecarSubtitleTracks) {
+                const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
+
+                const args = [
+                    '-hide_banner',
+                    '-loglevel', 'warning',
+                    '-user_agent', this.options.userAgent,
+                    '-probesize', this.options.fastSeek ? '4M' : '32M',
+                    '-analyzeduration', this.options.fastSeek ? '1M' : '8M',
+                    '-reconnect', '1',
+                    '-reconnect_at_eof', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_on_network_error', '1',
+                    '-reconnect_on_http_error', '4xx,5xx',
+                    '-reconnect_delay_max', this.options.fastSeek ? '1' : '2'
+                ];
+
+                if (this.options.fastSeek && this.options.seekOffset > 0) {
+                    args.push('-ss', String(this.options.seekOffset));
+                }
+
+                args.push(
+                    '-i', this.url,
+                    '-map', `0:${subtitleTrack.streamIndex}`,
+                    '-c:s', 'webvtt',
+                    '-f', 'webvtt',
+                    subtitlePath
+                );
+
+                console.log(
+                    `[TranscodeSession ${this.id}] Starting sidecar subtitle extraction: stream=${subtitleTrack.streamIndex}, file=${subtitleTrack.outputName}`
+                );
+
+                try {
+                    const proc = spawn(this.options.ffmpegPath, args, {
+                        cwd: this.dir,
+                        windowsHide: true
+                    });
+
+                    this.subtitleProcesses.push(proc);
+
+                    proc.stderr.on('data', (data) => {
+                        const msg = data.toString().trim();
+                        if (msg) {
+                            console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
+                        }
+                    });
+
+                    proc.on('exit', (code) => {
+                        console.log(
+                            `[TranscodeSession ${this.id}] Subtitle extraction exited for ${subtitleTrack.outputName} with code ${code}`
+                        );
+                    });
+
+                    proc.on('error', (err) => {
+                        console.error(
+                            `[TranscodeSession ${this.id}] Subtitle extraction error for ${subtitleTrack.outputName}:`,
+                            err
+                        );
+                    });
+                } catch (err) {
+                    console.error(
+                        `[TranscodeSession ${this.id}] Failed to start subtitle extraction for ${subtitleTrack.outputName}:`,
+                        err
+                    );
+                }
+            }
+        }
+
+    async ensureSidecarSubtitleReady(subtitleFileName) {
+        const subtitleTrack = this.getSidecarSubtitleTracks().find(
+            (track) => track.outputName === subtitleFileName
+        );
+
+        if (!subtitleTrack) {
+            return false;
+        }
+
+        const subtitlePath = path.join(this.dir, subtitleTrack.outputName);
+
+        const waitForExistingSubtitle = async (timeoutMs = 4000) => {
+            const start = Date.now();
+
+            while (Date.now() - start < timeoutMs) {
+                try {
+                    const content = await fs.readFile(subtitlePath, 'utf8');
+                    if (this.isUsableSubtitleContent(content, {
+                        minLength: this.options.fastSeek ? 500 : 800,
+                        minCueCount: this.options.fastSeek ? 4 : 6
+                    })) {
+                        return true;
+                    }
+                } catch {}
+
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+
+            return false;
+        };
+
+        if (await waitForExistingSubtitle(4000)) {
+            return true;
+        }
+
+        const existingExtraction = this.subtitleExtractionPromises.get(subtitleFileName);
+        if (existingExtraction) {
+            return existingExtraction;
+        }
+
+        const extractionPromise = (async () => {
+            console.log(
+                `[TranscodeSession ${this.id}] Building preview subtitle from local cache: ${subtitleTrack.outputName}`
+            );
+
+            const previewOk = await this.buildPreviewSubtitleWithRetries(subtitleTrack, subtitlePath);
+
+            if (!previewOk) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Preview subtitle could not be built from any cache stage: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
+
+            if (this.options.fastSeek) {
+                this.scheduleSubtitleUpgrade(subtitleTrack).catch((err) => {
+                    console.warn(
+                        `[TranscodeSession ${this.id}] Background subtitle upgrade failed for ${subtitleTrack.outputName}:`,
+                        err?.message || err
+                    );
+                });
+            }
+
+            return true;
+        })();
+
+        this.subtitleExtractionPromises.set(subtitleFileName, extractionPromise);
+
+        extractionPromise.finally(() => {
+            this.subtitleExtractionPromises.delete(subtitleFileName);
+        });
+
+        return extractionPromise;
+    }
+
+    async preloadFirstSubtitleTrack(timeoutMs = 20000) {
+        const subtitleTrack = this.getTextSubtitleTracks()[0];
+        if (!subtitleTrack) {
+            console.log(`[TranscodeSession ${this.id}] No text subtitle track available for preload`);
+            return null;
+        }
+
+        const subtitlePath = path.join(this.dir, 'sub_0.vtt');
+
+        try {
+            await fs.rm(subtitlePath, { force: true });
+        } catch {}
+
+        return new Promise((resolve) => {
+            const args = [
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-user_agent', this.options.userAgent,
+                '-probesize', '32M',
+                '-analyzeduration', '8M',
+                '-reconnect', '1',
+                '-reconnect_at_eof', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_on_network_error', '1',
+                '-reconnect_on_http_error', '4xx,5xx',
+                '-reconnect_delay_max', '2',
+                '-i', this.url,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                subtitlePath
+            ];
+
+            console.log(
+                `[TranscodeSession ${this.id}] Preloading first subtitle track before playback: stream=${subtitleTrack.streamIndex}, file=sub_0.vtt`
+            );
+
+            let settled = false;
+
+            const finish = async (ok) => {
+                if (settled) return;
+                settled = true;
+
+                if (ok) {
+                    try {
+                        const content = await fs.readFile(subtitlePath, 'utf8');
+                        if (content && content.includes('WEBVTT')) {
+                            console.log(
+                                `[TranscodeSession ${this.id}] First subtitle preload succeeded (length=${content.length})`
+                            );
+                            return resolve({
+                                index: 0,
+                                streamIndex: subtitleTrack.streamIndex,
+                                language: subtitleTrack.language || 'und',
+                                codec: subtitleTrack.codec,
+                                label: (subtitleTrack.language || 'und').toUpperCase(),
+                                outputName: 'sub_0.vtt'
+                            });
+                        }
+                    } catch {}
+                }
+
+                console.log(`[TranscodeSession ${this.id}] First subtitle preload did not complete in time`);
+                resolve(null);
+            };
+
+            try {
+                const proc = spawn(this.options.ffmpegPath, args, {
+                    cwd: this.dir,
+                    windowsHide: true
+                });
+
+                proc.stderr.on('data', (data) => {
+                    const msg = data.toString().trim();
+                    if (msg) {
+                        console.log(`[FFmpeg subtitle preload ${this.id}] ${msg}`);
+                    }
+                });
+
+                proc.on('error', () => finish(false));
+                proc.on('exit', (code) => finish(code === 0 || code === null));
+
+                setTimeout(() => {
+                    try { proc.kill('SIGKILL'); } catch {}
+                    finish(false);
+                }, timeoutMs);
+            } catch (err) {
+                console.error(
+                    `[TranscodeSession ${this.id}] Failed to start subtitle preload:`,
+                    err
+                );
+                finish(false);
+            }
+        });
+    }
+
+    startSourceCacheDownload() {
+    if (this.sourceCacheProcess) {
+        return;
+    }
+
+    const args = [
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-user_agent', this.options.userAgent,
+        '-probesize', '5000000',
+        '-analyzeduration', '5000000',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '3'
+    ];
+
+    if (this.options.fastSeek && this.options.seekOffset > 0) {
+        console.log(
+            `[TranscodeSession ${this.id}] Starting source cache download from fast-seek offset ${this.options.seekOffset}s`
+        );
+        args.push('-ss', String(this.options.seekOffset));
+    }
+
+    args.push(
+        '-i', this.url,
+        '-map', '0',
+        '-c', 'copy',
+        '-f', 'matroska',
+        this.sourceCachePath
+    );
+
+        console.log(
+            `[TranscodeSession ${this.id}] Starting local source cache download: ${this.sourceCachePath}`
+        );
+
+        try {
+            const proc = spawn(this.options.ffmpegPath, args, {
+                cwd: this.dir,
+                windowsHide: true
+            });
+
+            this.sourceCacheProcess = proc;
+
+            const sizeLogInterval = setInterval(async () => {
+                const info = await this.getSourceCacheInfo();
+                if (info.exists) {
+                    console.log(
+                        `[TranscodeSession ${this.id}] Source cache size: ${info.size} bytes`
+                    );
+                }
+            }, 5000);
+
+            proc.stderr.on('data', (data) => {
+                const msg = data.toString().trim();
+                if (msg) {
+                    console.log(`[FFmpeg source-cache ${this.id}] ${msg}`);
+                }
+            });
+
+            proc.on('exit', (code, signal) => {
+                console.log(
+                    `[TranscodeSession ${this.id}] Source cache download exited with code=${code} signal=${signal}`
+                );
+                if (this.sourceCacheProcess === proc) {
+                    this.sourceCacheProcess = null;
+                }
+                clearInterval(sizeLogInterval);
+            });
+
+            proc.on('error', (err) => {
+                console.error(
+                    `[TranscodeSession ${this.id}] Source cache download error:`,
+                    err
+                );
+                if (this.sourceCacheProcess === proc) {
+                    this.sourceCacheProcess = null;
+                }
+                clearInterval(sizeLogInterval);
+            });
+        } catch (err) {
+            console.error(
+                `[TranscodeSession ${this.id}] Failed to start source cache download:`,
+                err
+            );
+        }
+    }
+
+        stopSourceCacheDownload() {
+            if (!this.sourceCacheProcess) {
+                return;
+            }
+
+            console.log(`[TranscodeSession ${this.id}] Stopping source cache download after subtitle preload`);
+
+            try {
+                this.sourceCacheProcess.kill('SIGTERM');
+            } catch {}
+
+            setTimeout(() => {
+                if (this.sourceCacheProcess) {
+                    try {
+                        this.sourceCacheProcess.kill('SIGKILL');
+                    } catch {}
+                }
+            }, 2000);
+        }
+
+    async getSourceCacheInfo() {
+        try {
+            const stats = await fs.stat(this.sourceCachePath);
+            return {
+                exists: true,
+                size: stats.size
+            };
+        } catch {
+            return {
+                exists: false,
+                size: 0
+            };
+        }
+    }
+
+    isUsableSubtitleContent(content, options = {}) {
+        const minLength = options.minLength ?? 500;
+        const minCueCount = options.minCueCount ?? 4;
+
+        const normalized = content ? content.trim() : '';
+        if (!normalized || !normalized.includes('WEBVTT')) return false;
+
+        const cueCount = (normalized.match(/-->/g) || []).length;
+        if (cueCount < minCueCount) return false;
+        if (normalized.length < minLength) return false;
+
+        return true;
+    }
+
+    async waitForSourceCache(minSizeBytes, timeoutMs = 30000) {
+        if (!this.sourceCacheProcess) {
+            this.startSourceCacheDownload();
+        }
+
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                return true;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        return false;
+    }
+
+    async extractSubtitleFromCache(subtitleTrack, outputPath, validation = {}) {
+        return new Promise((resolve) => {
+            const args = [
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-probesize', '2M',
+                '-analyzeduration', '0',
+                '-i', this.sourceCachePath,
+                '-map', `0:${subtitleTrack.streamIndex}`,
+                '-c:s', 'webvtt',
+                '-f', 'webvtt',
+                outputPath
+            ];
+
+            let settled = false;
+
+            const finish = async () => {
+                if (settled) return;
+                settled = true;
+
+                try {
+                    const content = await fs.readFile(outputPath, 'utf8');
+                    resolve(this.isUsableSubtitleContent(content, validation));
+                } catch {
+                    resolve(false);
+                }
+            };
+
+            try {
+                const proc = spawn(this.options.ffmpegPath, args, {
+                    cwd: this.dir,
+                    windowsHide: true
+                });
+
+                proc.stderr.on('data', (data) => {
+                    const msg = data.toString().trim();
+                    if (msg) {
+                        console.log(`[FFmpeg subtitle ${this.id}] ${msg}`);
+                    }
+                });
+
+                proc.on('error', finish);
+                proc.on('exit', finish);
+
+                setTimeout(() => {
+                    try { proc.kill('SIGKILL'); } catch {}
+                    finish();
+                }, 12000);
+            } catch {
+                finish();
+            }
+        });
+    }
+
+    async buildPreviewSubtitleWithRetries(subtitleTrack, subtitlePath) {
+        const stages = this.options.fastSeek
+            ? [
+                { cacheSize: 40 * 1024 * 1024, timeoutMs: 5000, minLength: 500, minCueCount: 4, label: '40MB' },
+                { cacheSize: 120 * 1024 * 1024, timeoutMs: 8000, minLength: 700, minCueCount: 5, label: '120MB' },
+                { cacheSize: 240 * 1024 * 1024, timeoutMs: 12000, minLength: 900, minCueCount: 6, label: '240MB' },
+                { cacheSize: 360 * 1024 * 1024, timeoutMs: 18000, minLength: 1200, minCueCount: 8, label: '360MB' }
+            ]
+            : [
+                { cacheSize: 120 * 1024 * 1024, timeoutMs: 15000, minLength: 800, minCueCount: 6, label: '120MB' }
+            ];
+
+        for (const stage of stages) {
+            const ready = await this.waitForSourceCache(stage.cacheSize, stage.timeoutMs);
+            if (!ready) {
+                continue;
+            }
+
+            console.log(
+                `[TranscodeSession ${this.id}] Trying preview subtitle stage ${stage.label} for ${subtitleTrack.outputName}`
+            );
+
+            const ok = await this.extractSubtitleFromCache(subtitleTrack, subtitlePath, {
+                minLength: stage.minLength,
+                minCueCount: stage.minCueCount
+            });
+
+            if (ok) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Preview subtitle ready at stage ${stage.label}: ${subtitleTrack.outputName}`
+                );
+                return true;
+            }
+
+            console.log(
+                `[TranscodeSession ${this.id}] Preview subtitle stage ${stage.label} still too small: ${subtitleTrack.outputName}`
+            );
+        }
+
+        return false;
+    }
+
+    scheduleSubtitleUpgrade(subtitleTrack) {
+        const key = subtitleTrack.outputName;
+
+        if (this.subtitleUpgradePromises.has(key)) {
+            return this.subtitleUpgradePromises.get(key);
+        }
+
+        const promise = (async () => {
+            const stableReady = await this.waitForSourceCache(250 * 1024 * 1024, 60000);
+            if (!stableReady) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Stable subtitle upgrade timed out waiting for cache: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
+
+            const stablePath = path.join(this.dir, `${subtitleTrack.outputName}.stable.vtt`);
+            const publicPath = path.join(this.dir, subtitleTrack.outputName);
+
+            console.log(
+                `[TranscodeSession ${this.id}] Building stable subtitle upgrade for ${subtitleTrack.outputName}`
+            );
+
+            const ok = await this.extractSubtitleFromCache(subtitleTrack, stablePath, {
+                minLength: 1500,
+                minCueCount: 10
+            });
+
+            if (!ok) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Stable subtitle upgrade not usable yet: ${subtitleTrack.outputName}`
+                );
+                return false;
+            }
+
+            await fs.copyFile(stablePath, publicPath);
+
+            console.log(
+                `[TranscodeSession ${this.id}] Stable subtitle promoted: ${subtitleTrack.outputName}`
+            );
+
+            return true;
+        })();
+
+        this.subtitleUpgradePromises.set(key, promise);
+
+        promise.finally(() => {
+            this.subtitleUpgradePromises.delete(key);
+        });
+
+        return promise;
+    }
+
+    async preloadFirstSubtitleTrackFromLocalCache(timeoutMs = 15000, minSizeBytes = 180 * 1024 * 1024) {
+        const subtitleTrack = this.getTextSubtitleTracks()[0];
+        if (!subtitleTrack) {
+            console.log(`[TranscodeSession ${this.id}] No text subtitle track available for local-cache preload`);
+            return null;
+        }
+
+        const subtitlePath = path.join(this.dir, 'sub_0.vtt');
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Trying subtitle preload from local cache at ${cacheInfo.size} bytes`
+                );
+
+                try {
+                    await fs.rm(subtitlePath, { force: true });
+                } catch {}
+
+                const args = [
+                    '-hide_banner',
+                    '-loglevel', 'warning',
+                    '-i', this.sourceCachePath,
+                    '-map', `0:${subtitleTrack.streamIndex}`,
+                    '-c:s', 'webvtt',
+                    '-f', 'webvtt',
+                    subtitlePath
+                ];
+
+                try {
+                    await new Promise((resolve) => {
+                        const proc = spawn(this.options.ffmpegPath, args, {
+                            cwd: this.dir,
+                            windowsHide: true
+                        });
+
+                        let settled = false;
+                        const finish = () => {
+                            if (settled) return;
+                            settled = true;
+                            resolve();
+                        };
+
+                        proc.stderr.on('data', (data) => {
+                            const msg = data.toString().trim();
+                            if (msg) {
+                                console.log(`[FFmpeg subtitle local-cache ${this.id}] ${msg}`);
+                            }
+                        });
+
+                        proc.on('error', finish);
+                        proc.on('exit', finish);
+
+                        setTimeout(() => {
+                            try { proc.kill('SIGKILL'); } catch {}
+                            finish();
+                        }, 8000);
+                    });
+
+                    try {
+                        const content = await fs.readFile(subtitlePath, 'utf8');
+                        const normalized = content ? content.trim() : '';
+
+                        if (
+                            normalized &&
+                            normalized.includes('WEBVTT') &&
+                            normalized.length > 20 &&
+                            /-->/.test(normalized)
+                        ) {
+                            console.log(
+                                `[TranscodeSession ${this.id}] Local-cache subtitle preload succeeded (length=${content.length})`
+                            );
+
+                            return {
+                                index: 0,
+                                streamIndex: subtitleTrack.streamIndex,
+                                language: subtitleTrack.language || 'und',
+                                codec: subtitleTrack.codec,
+                                label: (subtitleTrack.language || 'und').toUpperCase(),
+                                outputName: 'sub_0.vtt'
+                            };
+                        }
+
+                        console.log(
+                            `[TranscodeSession ${this.id}] Local-cache subtitle preload produced incomplete subtitle output (length=${normalized.length})`
+                        );
+                    } catch {}
+                } catch (err) {
+                    console.error(
+                        `[TranscodeSession ${this.id}] Local-cache subtitle preload failed:`,
+                        err
+                    );
+                }
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        console.log(`[TranscodeSession ${this.id}] Local-cache subtitle preload did not complete in time`);
+        return null;
+    }
+
+    async preloadSubtitleTracksFromLocalCache(timeoutMs = 30000, minSizeBytes = 150 * 1024 * 1024) {
+        const subtitleTracks = this.getTextSubtitleTracks();
+
+        if (!subtitleTracks.length) {
+            console.log(`[TranscodeSession ${this.id}] No text subtitle tracks available for local-cache preload`);
+            return [];
+        }
+
+        const start = Date.now();
+        const readyTracks = [];
+        const completedIndexes = new Set();
+
+        while (Date.now() - start < timeoutMs) {
+            const cacheInfo = await this.getSourceCacheInfo();
+
+            if (cacheInfo.exists && cacheInfo.size >= minSizeBytes) {
+                console.log(
+                    `[TranscodeSession ${this.id}] Trying multi-subtitle preload from local cache at ${cacheInfo.size} bytes`
+                );
+
+                for (let i = 0; i < subtitleTracks.length; i++) {
+                    if (completedIndexes.has(i)) continue;
+
+                    const subtitleTrack = subtitleTracks[i];
+                    const outputName = `sub_${i}.vtt`;
+                    const subtitlePath = path.join(this.dir, outputName);
+
+                    try {
+                        await fs.rm(subtitlePath, { force: true });
+                    } catch {}
+
+                    const args = [
+                        '-hide_banner',
+                        '-loglevel', 'warning',
+                        '-i', this.sourceCachePath,
+                        '-map', `0:${subtitleTrack.streamIndex}`,
+                        '-c:s', 'webvtt',
+                        '-f', 'webvtt',
+                        subtitlePath
+                    ];
+
+                    try {
+                        await new Promise((resolve) => {
+                            const proc = spawn(this.options.ffmpegPath, args, {
+                                cwd: this.dir,
+                                windowsHide: true
+                            });
+
+                            let settled = false;
+                            const finish = () => {
+                                if (settled) return;
+                                settled = true;
+                                resolve();
+                            };
+
+                            proc.stderr.on('data', (data) => {
+                                const msg = data.toString().trim();
+                                if (msg) {
+                                    console.log(`[FFmpeg subtitle local-cache ${this.id}] ${msg}`);
+                                }
+                            });
+
+                            proc.on('error', finish);
+                            proc.on('exit', finish);
+
+                            setTimeout(() => {
+                                try { proc.kill('SIGKILL'); } catch {}
+                                finish();
+                            }, 8000);
+                        });
+
+                        try {
+                            const content = await fs.readFile(subtitlePath, 'utf8');
+                            const normalized = content ? content.trim() : '';
+
+                            if (
+                                normalized &&
+                                normalized.includes('WEBVTT') &&
+                                normalized.length > 20 &&
+                                /-->/.test(normalized)
+                            ) {
+                                readyTracks.push({
+                                    index: i,
+                                    streamIndex: subtitleTrack.streamIndex,
+                                    language: subtitleTrack.language || 'und',
+                                    codec: subtitleTrack.codec,
+                                    label: (subtitleTrack.language || 'und').toUpperCase(),
+                                    outputName
+                                });
+
+                                completedIndexes.add(i);
+
+                                console.log(
+                                    `[TranscodeSession ${this.id}] Local-cache subtitle preload succeeded for ${outputName} (length=${content.length})`
+                                );
+                            } else {
+                                console.log(
+                                    `[TranscodeSession ${this.id}] Local-cache subtitle preload produced incomplete output for ${outputName} (length=${normalized.length})`
+                                );
+                            }
+                        } catch {}
+                    } catch (err) {
+                        console.error(
+                            `[TranscodeSession ${this.id}] Local-cache subtitle preload failed for ${outputName}:`,
+                            err
+                        );
+                    }
+                }
+
+                if (readyTracks.length === subtitleTracks.length) {
+                    return readyTracks;
+                }
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        if (readyTracks.length > 0) {
+            console.log(
+                `[TranscodeSession ${this.id}] Multi-subtitle preload timed out, returning partial results (${readyTracks.length}/${subtitleTracks.length})`
+            );
+            return readyTracks;
+        }
+
+        console.log(`[TranscodeSession ${this.id}] Multi-subtitle local-cache preload did not complete in time`);
+        return [];
+    }
+
+    /*Check if the method to use multiple audio is needed*/ 
+    shouldUseMultiAudioHls() {
+    const audioTracks = this.inputStreamInfo?.audioTracks || [];
+    return audioTracks.length > 1;
+    }
+
+    getTextSubtitleTracks() {
+        const subtitleTracks = this.inputStreamInfo?.subtitleTracks || [];
+        const unsupportedCodecs = new Set([
+            'hdmv_pgs_subtitle',
+            'pgssub',
+            'dvd_subtitle',
+            'xsub'
+        ]);
+
+        return subtitleTracks.filter(track => !unsupportedCodecs.has(track.codec));
+    }
+
+    shouldUseSubtitleHls() {
+        return this.getTextSubtitleTracks().length > 0;
+    }
+
+    getSidecarSubtitleTracks() {
+        return this.getTextSubtitleTracks().map((track, i) => ({
+            ...track,
+            outputName: `sub_${i}.vtt`
+        }));
+    }
+
+
     /**
      * Build FFmpeg arguments for HLS output with optional GPU encoding
      */
     buildFFmpegArgs() {
         const segmentPattern = path.join(this.dir, 'seg%04d.m4s');
         const videoMode = this.options.videoMode || 'encode';
+        const useMultiAudioHls = this.shouldUseMultiAudioHls();
+        const textSubtitleTracks = this.getTextSubtitleTracks();
+        const sidecarSubtitleTracks = this.getSidecarSubtitleTracks();
+        const useSubtitleHls = textSubtitleTracks.length > 0;
 
         // Resolve 'auto' encoder to detected hardware, fallback to software
         let encoder = this.options.hwEncoder || 'software';
         if (encoder === 'auto') {
             const hwCaps = hwDetect.getCapabilities();
-            encoder = hwCaps?.recommended || 'software';
-            console.log(`[TranscodeSession ${this.id}] Auto encoder resolved to: ${encoder}`);
+            const recommendedEncoder = hwCaps?.recommended || 'software';
+
+            encoder = recommendedEncoder === 'amf' ? 'software' : recommendedEncoder;
+
+            console.log(
+                `[TranscodeSession ${this.id}] Auto encoder resolved to: ${recommendedEncoder}`
+            );
         }
 
         const args = [
@@ -186,33 +1211,68 @@ class TranscodeSession extends EventEmitter {
             '-loglevel', 'warning',
             '-user_agent', this.options.userAgent,
         ];
+        
+        if (useMultiAudioHls) {
+            console.log(
+                `[TranscodeSession ${this.id}] Multi-audio HLS mode requested for ${this.inputStreamInfo.audioTracks.length} audio tracks`
+            );
+        }
 
         // Add hardware acceleration input options based on encoder (only if encoding)
         if (videoMode === 'encode') {
             this.addHwAccelInputArgs(args, encoder);
         }
 
-        // Input options (common)
+        const inputProbeSize = this.options.fastSeek ? '4M' : '32M';
+        const inputAnalyzeDuration = this.options.fastSeek ? '1M' : '8M';
+        const reconnectDelayMax = this.options.fastSeek ? '1' : '2';
+
+        if (this.options.fastSeek) {
+            console.log(
+                `[TranscodeSession ${this.id}] Fast-seek session: using lighter probe settings (${inputProbeSize}, ${inputAnalyzeDuration})`
+            );
+        }
+
+        // Input options
         args.push(
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
+            '-probesize', inputProbeSize,
+            '-analyzeduration', inputAnalyzeDuration,
             '-fflags', '+genpts+discardcorrupt',
             '-err_detect', 'ignore_err',
             '-reconnect', '1',
+            '-reconnect_at_eof', '1',
             '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '3'
+            '-reconnect_on_network_error', '1',
+            '-reconnect_on_http_error', '4xx,5xx',
+            '-reconnect_delay_max', reconnectDelayMax
         );
+
+        if (this.options.seekOffset > 0 && this.options.fastSeek) {
+            console.log(
+                `[TranscodeSession ${this.id}] Using fast input seek at ${this.options.seekOffset}s`
+            );
+            args.push('-ss', String(this.options.seekOffset));
+        }
 
         args.push('-i', this.url);
 
-        // Add seek offset if specified (as output option to avoid Range requests)
-        if (this.options.seekOffset > 0) {
+        // Default path: output-side seek
+        if (this.options.seekOffset > 0 && !this.options.fastSeek) {
             args.push('-ss', String(this.options.seekOffset));
         }
 
         // Map streams
         args.push('-map', '0:v:0');
-        args.push('-map', '0:a:0?');
+
+        if (useMultiAudioHls) {
+            const audioTracks = this.inputStreamInfo?.audioTracks || [];
+            audioTracks.forEach((track, i) => {
+                args.push('-map', `0:a:${i}`);
+            });
+
+        } else {
+            args.push('-map', '0:a?');
+        }
 
         // Add video encoder and filters based on selected encoder OR copy
         if (videoMode === 'copy') {
@@ -229,6 +1289,51 @@ class TranscodeSession extends EventEmitter {
             }
         } else {
             this.addVideoEncoderArgs(args, encoder);
+        }
+
+        /*Early return in case of multi audio*/ 
+        if (useMultiAudioHls) {
+            console.log(`[TranscodeSession ${this.id}] Building master-playlist HLS with alternate audio`);
+
+            // Keep video settings from above, but force all audio tracks to AAC stereo
+            args.push(
+                '-c:a', 'aac',
+                '-ac:a', '2',
+                '-ar:a', '48000',
+                '-b:a', '192k'
+            );
+
+
+            const audioTracks = this.inputStreamInfo?.audioTracks || [];
+            const audioEntries = audioTracks.map((track, i) => {
+                const lang = (track.language || 'und').toLowerCase();
+                const safeName = lang === 'und' ? `audio${i + 1}` : lang;
+                const defaultFlag = i === 0 ? 'yes' : 'no';
+                return `a:${i},agroup:audio,language:${lang},name:${safeName},default:${defaultFlag}`;
+            });
+
+            const varStreamMap = [
+                'v:0,agroup:audio',
+                ...audioEntries
+            ].join(' ');
+
+            console.log(`[TranscodeSession ${this.id}] HLS var_stream_map (audio only): ${varStreamMap}`);
+
+            args.push(
+            '-master_pl_name', 'stream.m3u8',
+            '-var_stream_map', varStreamMap,
+            '-f', 'hls',
+            '-hls_time', String(SEGMENT_DURATION),
+            '-hls_list_size', '0',
+            '-hls_flags', 'independent_segments+append_list',
+            '-hls_segment_type', 'mpegts',
+            '-hls_segment_filename', this.segmentFilenamePattern,
+            this.variantPlaylistPattern
+        );
+
+        
+
+        return args;
         }
 
         // Audio: Apply mix preset
@@ -273,15 +1378,18 @@ class TranscodeSession extends EventEmitter {
         args.push(
             '-f', 'hls',
             '-hls_time', String(SEGMENT_DURATION),
-            '-hls_list_size', '0', // Keep all segments in playlist
+            '-hls_list_size', '0',
             '-hls_flags', 'independent_segments+append_list',
             '-hls_segment_type', 'mpegts',
             '-hls_segment_filename', path.join(this.dir, 'seg%04d.ts'),
             this.playlistPath
         );
 
+
         return args;
     }
+
+
 
     /**
      * Add hardware acceleration input arguments
@@ -371,15 +1479,20 @@ class TranscodeSession extends EventEmitter {
             '480p': 480
         };
 
-        // When upscaling is enabled, use the upscale target resolution
         if (this.options.upscaleEnabled) {
             const target = resolutionMap[this.options.upscaleTarget] || 1080;
             console.log(`[TranscodeSession ${this.id}] Upscale target height: ${target}p`);
             return target;
         }
 
-        // Otherwise, use max resolution as the cap
-        return resolutionMap[this.options.maxResolution] || 1080;
+        let target = resolutionMap[this.options.maxResolution] || 1080;
+
+        if (this.options.hwEncoder === 'amf' && target > 1080) {
+            console.log(`[TranscodeSession ${this.id}] Capping AMF target height to 1080p for compatibility`);
+            target = 1440;
+        }
+
+        return target;
     }
 
     /**
@@ -506,7 +1619,6 @@ class TranscodeSession extends EventEmitter {
             '-preset', 'veryfast',     // Fast for real-time
             '-crf', String(crf),
             '-profile:v', 'high',
-            '-level', '4.1',
             '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility (fixes 10-bit input errors)
         );
     }
@@ -525,6 +1637,38 @@ class TranscodeSession extends EventEmitter {
                 }
             }, 2000);
         }
+
+        if (this.sourceCacheProcess) {
+            console.log(`[TranscodeSession ${this.id}] Stopping source cache download`);
+            this.sourceCacheProcess.kill('SIGTERM');
+            setTimeout(() => {
+                if (this.sourceCacheProcess) {
+                    this.sourceCacheProcess.kill('SIGKILL');
+                }
+            }, 2000);
+        }
+
+        fs.rm(this.sourceCachePath, { force: true })
+            .then(() => {
+                console.log(`[TranscodeSession ${this.id}] Removed source cache file`);
+            })
+            .catch(() => {});
+
+        for (const proc of this.subtitleProcesses) {
+            try {
+                proc.kill('SIGTERM');
+            } catch {}
+        }
+
+        setTimeout(() => {
+            this.subtitleProcesses.forEach((proc) => {
+                try {
+                    proc.kill('SIGKILL');
+                } catch {}
+            });
+            this.subtitleProcesses = [];
+        }, 2000);
+
         this.status = 'stopped';
     }
 
@@ -542,8 +1686,10 @@ class TranscodeSession extends EventEmitter {
         try {
             await fs.access(this.playlistPath);
             const content = await fs.readFile(this.playlistPath, 'utf8');
-            // Check if playlist has at least one segment
-            return content.includes('.ts');
+
+            // Master playlist is ready if it references at least one child playlist,
+            // or a regular playlist is ready if it references segments.
+           return content.includes('.m3u8') || content.includes('.ts') || content.includes('.vtt') || (await fs.readdir(this.dir)).some(name => name.endsWith('.vtt'));
         } catch {
             return false;
         }
@@ -566,10 +1712,13 @@ class TranscodeSession extends EventEmitter {
     /**
      * Get the HLS playlist content
      */
-    async getPlaylist() {
-        this.touch();
-        try {
-            return await fs.readFile(this.playlistPath, 'utf8');
+    async getPlaylist(playlistName = 'stream.m3u8') {
+    this.touch();
+
+    const targetPath = path.join(this.dir, playlistName);
+
+    try {
+            return await fs.readFile(targetPath, 'utf8');
         } catch (err) {
             return null;
         }

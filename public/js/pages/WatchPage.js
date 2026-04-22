@@ -65,6 +65,11 @@ class WatchPage {
         this.captionsMenu = document.getElementById('watch-captions-menu');
         this.captionsList = document.getElementById('watch-captions-list');
 
+        // Audio
+        this.audioBtn = document.getElementById('watch-audio-btn');
+        this.audioMenu = document.getElementById('watch-audio-menu');
+        this.audioList = document.getElementById('watch-audio-list');
+
         // Transcode Status
         this.transcodeStatusEx = document.getElementById('watch-transcode-status');
         this.qualityBadgeEl = document.getElementById('watch-quality-badge');
@@ -79,6 +84,18 @@ class WatchPage {
         this.isFavorite = false;
         this.returnPage = null;
         this.captionsMenuOpen = false;
+        this.audioMenuOpen = false;
+        this.isLoadingVideo = false;
+        this.currentLoadRequestId = 0;
+        this.currentPlaybackToken = 0;
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
+        this.subtitleRefreshInterval = null;
+        this.currentTranscodeOptions = null;
+        this.pendingSeekPercent = null;
+        this.isSeekPreviewing = false;
+        this.fullDuration = 0;
+        this.sessionTimeOffset = 0;
 
         // Overlay timer
         this.overlayTimeout = null;
@@ -180,7 +197,18 @@ class WatchPage {
         });
 
         // Progress bar
-        this.progressSlider?.addEventListener('input', (e) => this.seek(e.target.value));
+        this.progressSlider?.addEventListener('input', (e) => this.previewSeek(e.target.value));
+        this.progressSlider?.addEventListener('change', (e) => this.seek(e.target.value));
+        this.progressSlider?.addEventListener('mouseup', () => {
+            if (this.pendingSeekPercent !== null) {
+                this.seek(this.pendingSeekPercent);
+            }
+        });
+        this.progressSlider?.addEventListener('touchend', () => {
+            if (this.pendingSeekPercent !== null) {
+                this.seek(this.pendingSeekPercent);
+            }
+        });
 
         // Video events
         this.video?.addEventListener('timeupdate', () => this.updateProgress());
@@ -222,12 +250,24 @@ class WatchPage {
             this.toggleCaptionsMenu();
         });
 
-        // Close captions menu when clicking outside
+        // Close captions/audio menus when clicking outside
         document.addEventListener('click', (e) => {
             if (this.captionsMenuOpen && !this.captionsMenu?.contains(e.target) && e.target !== this.captionsBtn) {
                 this.closeCaptionsMenu();
             }
+
+            if (this.audioMenuOpen && !this.audioMenu?.contains(e.target) && e.target !== this.audioBtn) {
+                this.closeAudioMenu();
+            }
         });
+
+        // Audio toggle
+        this.audioBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleAudioMenu();
+        });
+
+        
 
         // Hide scroll hint after scrolling
         const watchPage = document.getElementById('page-watch');
@@ -246,6 +286,18 @@ class WatchPage {
      * @param {string} streamUrl - Stream URL
      */
     async play(content, streamUrl) {
+        console.log(
+            '[WatchPage] play() content payload inline:',
+            JSON.stringify({
+                id: content?.id,
+                title: content?.title,
+                duration: content?.duration,
+                durationSeconds: content?.durationSeconds,
+                runtime: content?.runtime,
+                movie_duration: content?.movie_duration,
+                containerExtension: content?.containerExtension
+            })
+        );
         this.content = content;
         this.contentType = content.type;
         this.seriesInfo = content.seriesInfo || null;
@@ -341,6 +393,8 @@ class WatchPage {
             if (!res.ok) throw new Error('Failed to start session');
             const session = await res.json();
             this.currentSessionId = session.sessionId;
+            this.currentSubtitleTracks = Array.isArray(session.subtitleTracks) ? session.subtitleTracks : [];
+            console.log('[WatchPage] Session subtitle tracks:', this.currentSubtitleTracks);
             return session.playlistUrl;
         } catch (err) {
             console.error('[WatchPage] Session start failed:', err);
@@ -363,6 +417,9 @@ class WatchPage {
             }
             this.currentSessionId = null;
         }
+
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
     }
 
     async updateTranscodeStatus(mode, text) {
@@ -410,8 +467,43 @@ class WatchPage {
     }
 
     async loadVideo(url) {
+
+        /**Track Load Request */
+        const loadRequestId = ++this.currentLoadRequestId;
+
+        if (this.isLoadingVideo) {
+            console.warn('[WatchPage] loadVideo skipped because another load is already in progress');
+            return;
+        }
+
+
+        try {
+        this.isLoadingVideo = true;
+
         // Store the URL for copy functionality
         this.currentUrl = url;
+
+        // Reset subtitle state before loading a new source
+        this.currentSubtitleTracks = [];
+        this.activeSubtitleIndex = -1;
+        this.fullDuration =
+            this.parseDurationToSeconds(this.content?.durationSeconds) ||
+            this.parseDurationToSeconds(this.content?.duration) ||
+            this.parseDurationToSeconds(this.content?.runtime) ||
+            this.parseDurationToSeconds(this.content?.movie_duration) ||
+            0;
+        this.sessionTimeOffset = 0;
+
+            console.log(
+            '[WatchPage] duration parse debug inline:',
+            JSON.stringify({
+                rawDurationSeconds: this.content?.durationSeconds,
+                rawDuration: this.content?.duration,
+                runtime: this.content?.runtime,
+                movie_duration: this.content?.movie_duration,
+                parsedFullDuration: this.fullDuration
+            })
+        );
 
         // Stop any existing playback
         this.stop();
@@ -431,6 +523,10 @@ class WatchPage {
         const looksLikeHls = url.includes('.m3u8') || url.includes('m3u8');
         const isRawTs = url.includes('.ts') && !url.includes('.m3u8');
         const isDirectVideo = url.includes('.mp4') || url.includes('.mkv') || url.includes('.avi');
+        const shouldTryDirectFirst = false;
+
+
+       
 
         // Priority 0: Auto Transcode (Smart) - probe first, then decide
         if (settings.autoTranscode) {
@@ -441,9 +537,23 @@ class WatchPage {
                 const info = await probeRes.json();
                 console.log(`[WatchPage] Probe result: video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
 
+                /*Check after probing*/ 
+                const audioTrackCount =
+                    info.audioTrackCount ||
+                    info.audioTracks?.length ||
+                    1;
+
+                
+
                 // Store early probe info for quality display
                 this.currentStreamInfo = info;
                 this.updateQualityBadge();
+
+                if (Number(info.duration) > 0) {
+                    this.fullDuration = Number(info.duration);
+                }
+
+                
 
                 if (info.needsTranscode || settings.upscaleEnabled) {
                     console.log(`[WatchPage] Auto: Using HLS transcode session (${settings.upscaleEnabled ? 'Upscaling' : 'Incompatible audio/video'})`);
@@ -455,13 +565,16 @@ class WatchPage {
                     const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
 
                     this.updateTranscodeStatus(statusMode, statusText);
-                    const playlistUrl = await this.startTranscodeSession(url, {
+
+                    this.currentTranscodeOptions = {
                         videoMode,
-                        seekOffset: this.resumeTime, // Ensure seekOffset is passed
+                        seekOffset: 0,
                         videoCodec: info.video,
                         audioCodec: info.audio,
                         audioChannels: info.audioChannels
-                    });
+                    };
+
+                    const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
                     this.playHls(playlistUrl);
                     this.setVolumeFromStorage();
                     return;
@@ -471,6 +584,7 @@ class WatchPage {
                     console.log('[WatchPage] Auto: Using remux (.ts container)');
                     this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
                     const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
+                    this.currentTranscodeOptions = null;
                     this.video.src = finalUrl;
                     this.video.play().catch(e => {
                         if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
@@ -492,10 +606,14 @@ class WatchPage {
             const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
             console.log(`[WatchPage] ${statusText} enabled. Starting session (encode)...`);
             this.updateTranscodeStatus(statusMode, statusText);
-            const playlistUrl = await this.startTranscodeSession(url, {
+            this.updateTranscodeStatus(statusMode, statusText);
+
+            this.currentTranscodeOptions = {
                 videoMode: 'encode',
                 seekOffset: this.resumeTime
-            });
+            };
+
+            const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -514,11 +632,13 @@ class WatchPage {
                 videoCodec = info.video;
             } catch (e) { console.warn('Probe failed for force audio, assuming h264'); }
 
-            const playlistUrl = await this.startTranscodeSession(url, {
+            this.currentTranscodeOptions = {
                 videoMode: 'copy',
                 videoCodec,
                 seekOffset: this.resumeTime
-            });
+            };
+
+            const playlistUrl = await this.startTranscodeSession(url, this.currentTranscodeOptions);
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -545,6 +665,7 @@ class WatchPage {
         console.log('[WatchPage] Playing:', { url, needsProxy, looksLikeHls });
 
         // Use HLS.js for HLS streams
+        this.currentTranscodeOptions = null;
         if (looksLikeHls && Hls.isSupported()) {
             this.updateTranscodeStatus('direct', 'Direct HLS');
             this.playHls(finalUrl);
@@ -558,17 +679,26 @@ class WatchPage {
         }
 
         this.setVolumeFromStorage();
+
+
+            } finally {
+                if (this.currentLoadRequestId === loadRequestId) {
+                    this.isLoadingVideo = false;
+                }
+            }
     }
 
     /**
      * Play HLS stream using Hls.js
      */
-    playHls(url) {
-        if (this.hls) {
-            this.hls.destroy();
-        }
+        playHls(url, playbackToken = this.currentPlaybackToken) {
+            if (this.hls) {
+                this.hls.destroy();
+            }
 
-        this.hls = new Hls({
+            const token = playbackToken;
+
+            this.hls = new Hls({
             maxBufferLength: 30,
             maxMaxBufferLength: 60,
             startLevel: -1,
@@ -578,24 +708,65 @@ class WatchPage {
         this.hls.loadSource(url);
         this.hls.attachMedia(this.video);
 
+        this.hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
+            console.log('[WatchPage] Audio tracks updated:', data.audioTracks || this.hls.audioTracks);
+            this.updateAudioTracks();
+        });
+
+        this.hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
+            console.log('[WatchPage] Audio track switched:', data);
+            this.updateAudioTracks();
+        });
+
         // Listen for subtitle track updates
         this.hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Subtitle tracks updated:', data.subtitleTracks);
-            // Wait a moment for native text tracks to populate
-            setTimeout(() => this.updateCaptionsTracks(), 100);
+            setTimeout(() => {
+                if (token !== this.currentPlaybackToken) return;
+                this.updateCaptionsTracks();
+            }, 100);
         });
 
         this.hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             console.log('[WatchPage] Subtitle track switched:', data);
         });
 
+
         this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (token !== this.currentPlaybackToken) return;
+            console.log('[WatchPage] MANIFEST_PARSED audioTracks:', this.hls.audioTracks);
+
+            if (this.video?.audioTracks) {
+                console.log('[WatchPage] video.audioTracks length:', this.video.audioTracks.length);
+            } else {
+                console.log('[WatchPage] video.audioTracks not supported');
+            }
+
+            if (this.video?.textTracks) {
+                console.log('[WatchPage] video.textTracks length:', this.video.textTracks.length);
+            }
+
+            this.updateAudioTracks();
+            this.clearSidecarSubtitleTracks();
+
+            setTimeout(() => {
+                if (token !== this.currentPlaybackToken) return;
+                this.updateCaptionsTracks();
+            }, 300);
+
             this.video.play().catch(e => {
-                if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+                if (e.name !== 'AbortError' && token === this.currentPlaybackToken) {
+                    console.error('[WatchPage] Autoplay error:', e);
+                }
             });
         });
 
         this.hls.on(Hls.Events.ERROR, (event, data) => {
+            if (token !== this.currentPlaybackToken) return;
             if (data.fatal) {
                 console.error('[WatchPage] HLS fatal error:', data);
                 // Try proxy on CORS error (only if not already proxied/transcoded)
@@ -610,13 +781,106 @@ class WatchPage {
         });
     }
 
-    setVolumeFromStorage() {
+        setVolumeFromStorage() {
         const savedVolume = localStorage.getItem('nodecast-volume') || '80';
         this.video.volume = parseInt(savedVolume) / 100;
         if (this.volumeSlider) this.volumeSlider.value = savedVolume;
     }
 
+    clearSidecarSubtitleTracks() {
+    if (!this.video) return;
+
+    const existingTracks = this.video.querySelectorAll('track[data-sidecar-subtitle="true"]');
+    existingTracks.forEach(track => track.remove());
+    }
+
+    attachSelectedSidecarSubtitleTrack(subtitleTrack) {
+    if (!this.video || !subtitleTrack) return;
+
+    const existingTracks = Array.from(
+        this.video.querySelectorAll('track[data-sidecar-subtitle="true"]')
+    );
+
+    const trackEl = document.createElement('track');
+    trackEl.kind = 'subtitles';
+    trackEl.label = subtitleTrack.label || (subtitleTrack.language || 'und').toUpperCase();
+    trackEl.srclang = subtitleTrack.language || 'und';
+    trackEl.src = `${subtitleTrack.url}${subtitleTrack.url.includes('?') ? '&' : '?'}v=${Date.now()}`;
+    trackEl.default = false;
+    trackEl.setAttribute('data-sidecar-subtitle', 'true');
+    trackEl.setAttribute('data-sidecar-pending', 'true');
+
+    const activateTrack = () => {
+        const textTracks = this.video.textTracks;
+
+        for (let i = 0; i < textTracks.length; i++) {
+            if (textTracks[i].kind === 'subtitles' || textTracks[i].kind === 'captions') {
+                textTracks[i].mode = 'disabled';
+            }
+        }
+
+        const currentTextTrack = trackEl.track || textTracks[textTracks.length - 1];
+        if (currentTextTrack && (currentTextTrack.kind === 'subtitles' || currentTextTrack.kind === 'captions')) {
+            currentTextTrack.mode = 'showing';
+        }
+
+        // Only remove old sidecar tracks after the new one is really loaded
+        existingTracks.forEach(track => {
+            if (track !== trackEl) track.remove();
+        });
+
+        trackEl.removeAttribute('data-sidecar-pending');
+        this.updateCaptionsTracks();
+    };
+
+    trackEl.addEventListener('load', () => {
+        console.log('[WatchPage] Sidecar subtitle loaded:', trackEl.src);
+        activateTrack();
+    });
+
+    trackEl.addEventListener('error', () => {
+        console.warn('[WatchPage] Sidecar subtitle failed to load:', trackEl.src);
+        trackEl.remove();
+        this.updateCaptionsTracks();
+    });
+
+    this.video.appendChild(trackEl);
+
+    // Force the browser to fetch the track, but do not leave it hidden if it loads fast
+    const pendingTextTrack = trackEl.track;
+    if (pendingTextTrack && (pendingTextTrack.kind === 'subtitles' || pendingTextTrack.kind === 'captions')) {
+        console.log('[WatchPage] Forcing subtitle track activation for fetch:', subtitleTrack.url);
+        pendingTextTrack.mode = 'hidden';
+    }
+}
+
+    startSubtitleRefreshLoop() {
+            this.stopSubtitleRefreshLoop();
+
+            this.subtitleRefreshInterval = setInterval(() => {
+                if (!this.video) return;
+                if (this.activeSubtitleIndex < 0) return;
+                if (!Array.isArray(this.currentSubtitleTracks)) return;
+
+                const subtitleTrack = this.currentSubtitleTracks[this.activeSubtitleIndex];
+                if (!subtitleTrack) return;
+
+                console.log('[WatchPage] Refreshing active subtitle track:', subtitleTrack);
+                this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
+            }, 15000);
+        }
+
+        stopSubtitleRefreshLoop() {
+            if (this.subtitleRefreshInterval) {
+                clearInterval(this.subtitleRefreshInterval);
+                this.subtitleRefreshInterval = null;
+            }
+        }
+
     stop() {
+        this.currentPlaybackToken++;
+        this.stopSubtitleRefreshLoop();
+
         // Stop history tracking and save final progress
         this.stopHistoryTracking();
         this.saveProgress();
@@ -644,6 +908,8 @@ class WatchPage {
         this.hideNowPlaying();
     }
 
+  
+
     // === Playback Controls ===
 
     togglePlay() {
@@ -655,15 +921,105 @@ class WatchPage {
     }
 
     skip(seconds) {
-        if (this.video) {
-            this.video.currentTime = Math.max(0, Math.min(this.video.currentTime + seconds, this.video.duration || 0));
+        if (!this.video) return;
+
+        const duration = this.fullDuration || this.video.duration || 0;
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const targetTime = Math.max(0, Math.min(effectiveCurrentTime + seconds, duration || effectiveCurrentTime + seconds));
+
+        if (this.currentSessionId && this.currentTranscodeOptions && targetTime < this.sessionTimeOffset) {
+            this.restartTranscodeAt(targetTime);
+            return;
+        }
+
+        const localTargetTime = Math.max(0, targetTime - this.sessionTimeOffset);
+        this.video.currentTime = localTargetTime;
+    }
+
+    previewSeek(percent) {
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!duration) return;
+
+        const numericPercent = Math.max(0, Math.min(100, Number(percent)));
+        this.pendingSeekPercent = numericPercent;
+        this.isSeekPreviewing = true;
+
+        const targetTime = (numericPercent / 100) * duration;
+
+        if (this.progressSlider) {
+            this.progressSlider.value = numericPercent;
+        }
+
+        if (this.timeCurrent) {
+            this.timeCurrent.textContent = this.formatTime(targetTime);
         }
     }
 
-    seek(percent) {
-        if (this.video && this.video.duration) {
-            this.video.currentTime = (percent / 100) * this.video.duration;
+    async restartTranscodeAt(targetTime) {
+        if (!this.currentUrl || !this.currentTranscodeOptions) return;
+
+        const normalizedTarget = Math.max(0, Math.floor(targetTime));
+
+        console.log('[WatchPage] Restarting transcode session at:', normalizedTarget);
+
+        this.showLoading();
+
+        await this.stopTranscodeSession();
+
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
         }
+
+        if (this.video) {
+            this.video.pause();
+            this.video.removeAttribute('src');
+            this.video.load();
+        }
+
+        const seekOptions = {
+            ...this.currentTranscodeOptions,
+            seekOffset: normalizedTarget,
+            fastSeek: true
+        };
+
+        this.sessionTimeOffset = normalizedTarget;
+
+        if (this.timeCurrent) {
+            this.timeCurrent.textContent = this.formatTime(normalizedTarget);
+        }
+
+        const playlistUrl = await this.startTranscodeSession(this.currentUrl, seekOptions);
+        this.playHls(playlistUrl);
+        this.setVolumeFromStorage();
+    }
+
+    async seek(percent) {
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!this.video || !duration) return;
+
+        const numericPercent = Math.max(0, Math.min(100, Number(percent)));
+        const targetTime = (numericPercent / 100) * duration;
+
+        this.pendingSeekPercent = null;
+        this.isSeekPreviewing = false;
+
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const delta = targetTime - effectiveCurrentTime;
+
+        const targetBeforeCurrentSession = targetTime < this.sessionTimeOffset;
+        const shouldRestartSession =
+            !!this.currentSessionId &&
+            !!this.currentTranscodeOptions &&
+            (targetBeforeCurrentSession || delta >= 90);
+
+        if (shouldRestartSession) {
+            await this.restartTranscodeAt(targetTime);
+            return;
+        }
+
+        const localTargetTime = Math.max(0, targetTime - this.sessionTimeOffset);
+        this.video.currentTime = localTargetTime;
     }
 
     toggleMute() {
@@ -768,11 +1124,16 @@ class WatchPage {
     // === UI Updates ===
 
     updateProgress() {
-        if (!this.video || !this.video.duration) return;
+        const duration = this.fullDuration || this.video?.duration || 0;
+        if (!this.video || !duration) return;
 
-        const percent = (this.video.currentTime / this.video.duration) * 100;
-        this.progressSlider.value = percent;
-        this.timeCurrent.textContent = this.formatTime(this.video.currentTime);
+        const effectiveCurrentTime = this.sessionTimeOffset + (this.video.currentTime || 0);
+        const percent = (effectiveCurrentTime / duration) * 100;
+
+        if (!this.isSeekPreviewing) {
+            this.progressSlider.value = Math.max(0, Math.min(100, percent));
+            this.timeCurrent.textContent = this.formatTime(effectiveCurrentTime);
+        }
 
         // Show "Up Next" panel early for series (like streaming services do during credits)
         // Only show if auto-play next episode is enabled
@@ -807,15 +1168,33 @@ class WatchPage {
             this.updateQualityBadge();
         }
 
+        const mediaDuration = this.video?.duration || 0;
+        const usingTranscodeSession = !!this.currentSessionId && !!this.currentTranscodeOptions;
+
+        console.log('[WatchPage] metadata duration debug:', {
+            mediaDuration,
+            fullDuration: this.fullDuration,
+            usingTranscodeSession
+        });
+
+        // Only trust video.duration when we are NOT in a growing HLS transcode session
+        if (!this.fullDuration && mediaDuration && !usingTranscodeSession) {
+            this.fullDuration = mediaDuration;
+        }
+
+        if (this.timeTotal) {
+            this.timeTotal.textContent = this.formatTime(this.fullDuration || mediaDuration || 0);
+        }
+
         // Handle resumption
         if (this.resumeTime > 0 && this.video) {
-            const duration = this.video.duration;
+            const duration = this.fullDuration || mediaDuration;
             // Only resume if not near the end (95%)
             if (!duration || this.resumeTime < duration * 0.95) {
                 console.log(`[WatchPage] Resuming at ${this.resumeTime}s`);
                 this.video.currentTime = this.resumeTime;
             }
-            this.resumeTime = 0; // Reset after use
+            this.resumeTime = 0;
         }
     }
 
@@ -876,6 +1255,57 @@ class WatchPage {
         return `${m}:${s.toString().padStart(2, '0')}`;
     }
 
+    parseDurationToSeconds(value) {
+        if (typeof value === 'number' && isFinite(value) && value > 0) {
+            return value;
+        }
+
+        if (typeof value !== 'string') {
+            return 0;
+        }
+
+        const raw = value.trim();
+        if (!raw) {
+            return 0;
+        }
+
+        if (/^\d+(\.\d+)?$/.test(raw)) {
+            const numeric = Number(raw);
+            return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+        }
+
+        const clockParts = raw.split(':').map(part => part.trim());
+        if (clockParts.length >= 2 && clockParts.length <= 3 && clockParts.every(part => /^\d+$/.test(part))) {
+            let hours = 0;
+            let minutes = 0;
+            let seconds = 0;
+
+            if (clockParts.length === 3) {
+                hours = Number(clockParts[0]);
+                minutes = Number(clockParts[1]);
+                seconds = Number(clockParts[2]);
+            } else {
+                minutes = Number(clockParts[0]);
+                seconds = Number(clockParts[1]);
+            }
+
+            return (hours * 3600) + (minutes * 60) + seconds;
+        }
+
+        const hoursMatch = raw.match(/(\d+)\s*h/i);
+        const minutesMatch = raw.match(/(\d+)\s*m/i);
+        const secondsMatch = raw.match(/(\d+)\s*s/i);
+
+        if (hoursMatch || minutesMatch || secondsMatch) {
+            const hours = hoursMatch ? Number(hoursMatch[1]) : 0;
+            const minutes = minutesMatch ? Number(minutesMatch[1]) : 0;
+            const seconds = secondsMatch ? Number(secondsMatch[1]) : 0;
+            return (hours * 3600) + (minutes * 60) + seconds;
+        }
+
+        return 0;
+    }
+
     // === Loading Spinner ===
 
     showLoading() {
@@ -904,59 +1334,190 @@ class WatchPage {
         this.captionsMenuOpen = false;
     }
 
-    updateCaptionsTracks() {
-        if (!this.captionsList || !this.video) return;
+    toggleAudioMenu() {
+        if (this.audioMenuOpen) {
+            this.closeAudioMenu();
+        } else {
+            this.updateAudioTracks();
+            this.audioMenu?.classList.remove('hidden');
+            this.audioMenuOpen = true;
+        }
+    }
 
-        // Build list of available text tracks
-        const tracks = this.video.textTracks;
-        let html = '<button class="captions-option" data-index="-1">Off</button>';
+    closeAudioMenu() {
+        this.audioMenu?.classList.add('hidden');
+        this.audioMenuOpen = false;
+    }
+
+    updateAudioTracks() {
+        if (!this.audioList) return;
+
+        let tracks = [];
+
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks.length > 0) {
+            tracks = this.hls.audioTracks;
+        } else if (this.video?.audioTracks && this.video.audioTracks.length > 0) {
+            tracks = Array.from(this.video.audioTracks);
+        }
+
+        console.log('[WatchPage] updateAudioTracks raw tracks:', tracks);
+        if (!tracks.length) {
+            this.audioList.innerHTML = '<button class="captions-option active" data-index="-1">No audio tracks found</button>';
+            return;
+        }
+
+        const currentIndex = this.hls
+            ? this.hls.audioTrack
+            : tracks.findIndex(track => track.enabled);
+
+        let html = '';
 
         for (let i = 0; i < tracks.length; i++) {
             const track = tracks[i];
-            if (track.kind === 'subtitles' || track.kind === 'captions') {
-                const label = track.label || track.language || `Track ${i + 1}`;
-                const isActive = track.mode === 'showing';
-                html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${i}">${label}</button>`;
-            }
+            const label =
+                track.name ||
+                track.label ||
+                track.lang ||
+                track.language ||
+                `Track ${i + 1}`;
+
+            const isActive = i === currentIndex;
+            html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${i}">${label}</button>`;
         }
 
-        // Check if any track is active, if not mark "Off" as active
-        let anyActive = false;
-        for (let i = 0; i < tracks.length; i++) {
-            if (tracks[i].mode === 'showing') anyActive = true;
+        this.audioList.innerHTML = html;
+
+        this.audioList.querySelectorAll('.captions-option').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const index = parseInt(btn.dataset.index, 10);
+                this.selectAudioTrack(index);
+            });
+        });
+    }
+
+    selectAudioTrack(index) {
+        if (index < 0) return;
+
+        if (this.hls && Array.isArray(this.hls.audioTracks) && this.hls.audioTracks[index]) {
+            this.hls.audioTrack = index;
+        } else if (this.video?.audioTracks && this.video.audioTracks[index]) {
+            Array.from(this.video.audioTracks).forEach((track, i) => {
+                track.enabled = i === index;
+            });
         }
-        if (!anyActive) {
-            html = html.replace('class="captions-option"', 'class="captions-option active"');
-        }
+
+        this.updateAudioTracks();
+        this.closeAudioMenu();
+    }
+
+    updateCaptionsTracks() {
+        if (!this.captionsList) return;
+
+        const hlsSubtitleTracks =
+            this.hls && Array.isArray(this.hls.subtitleTracks) ? this.hls.subtitleTracks : [];
+
+        const subtitleOptions =
+            hlsSubtitleTracks.length > 0
+                ? hlsSubtitleTracks
+                : (Array.isArray(this.currentSubtitleTracks) ? this.currentSubtitleTracks : []);
+
+        const activeSubtitleIndex =
+            typeof this.activeSubtitleIndex === 'number' ? this.activeSubtitleIndex : -1;
+
+        console.log('[WatchPage] Subtitle menu options:', subtitleOptions);
+
+        let html = `<button class="captions-option ${activeSubtitleIndex < 0 ? 'active' : ''}" data-index="-1">Off</button>`;
+
+        subtitleOptions.forEach((subtitleTrack, index) => {
+            const label =
+                subtitleTrack.name ||
+                subtitleTrack.label ||
+                subtitleTrack.lang ||
+                subtitleTrack.language ||
+                `Track ${index + 1}`;
+
+            const isActive = index === activeSubtitleIndex;
+            html += `<button class="captions-option ${isActive ? 'active' : ''}" data-index="${index}">${label}</button>`;
+        });
 
         this.captionsList.innerHTML = html;
 
-        // Add click handlers
         this.captionsList.querySelectorAll('.captions-option').forEach(btn => {
-            btn.addEventListener('click', () => this.selectCaptionTrack(parseInt(btn.dataset.index)));
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.selectCaptionTrack(parseInt(btn.dataset.index, 10));
+            });
         });
     }
 
     selectCaptionTrack(index) {
+        console.log('[WatchPage] selectCaptionTrack called with index:', index);
+
         if (!this.video) return;
+
+        const hasHlsSubtitleTracks =
+            this.hls && Array.isArray(this.hls.subtitleTracks) && this.hls.subtitleTracks.length > 0;
+
+        if (hasHlsSubtitleTracks) {
+            if (index < 0) {
+                this.activeSubtitleIndex = -1;
+                this.hls.subtitleTrack = -1;
+                this.stopSubtitleRefreshLoop();
+                this.updateCaptionsTracks();
+                this.closeCaptionsMenu();
+                return;
+            }
+
+            if (!this.hls.subtitleTracks[index]) {
+                console.warn('[WatchPage] No HLS subtitle track found for index:', index);
+                this.activeSubtitleIndex = -1;
+                this.updateCaptionsTracks();
+                this.closeCaptionsMenu();
+                return;
+            }
+
+            this.activeSubtitleIndex = index;
+            console.log('[WatchPage] Switching HLS subtitle track:', this.hls.subtitleTracks[index]);
+            this.hls.subtitleTrack = index;
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
+        }
 
         const tracks = this.video.textTracks;
 
-        // Disable all tracks
         for (let i = 0; i < tracks.length; i++) {
-            tracks[i].mode = 'hidden';
+            if (tracks[i].kind === 'subtitles' || tracks[i].kind === 'captions') {
+                tracks[i].mode = 'disabled';
+            }
         }
 
-        // Enable selected track
-        if (index >= 0 && index < tracks.length) {
-            tracks[index].mode = 'showing';
+        if (index < 0) {
+            this.activeSubtitleIndex = -1;
+            this.stopSubtitleRefreshLoop();
+            this.clearSidecarSubtitleTracks();
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
         }
 
-        // Update UI
+        const subtitleTrack = this.currentSubtitleTracks[index];
+        if (!subtitleTrack) {
+            console.warn('[WatchPage] No subtitle metadata found for index:', index);
+            this.activeSubtitleIndex = -1;
+            this.updateCaptionsTracks();
+            this.closeCaptionsMenu();
+            return;
+        }
+
+        this.activeSubtitleIndex = index;
+        console.log('[WatchPage] Attaching selected subtitle track:', subtitleTrack);
+        this.attachSelectedSidecarSubtitleTrack(subtitleTrack);
+        this.startSubtitleRefreshLoop();
         this.updateCaptionsTracks();
         this.closeCaptionsMenu();
     }
-
     // === Overlay Auto-Hide ===
 
     showOverlay() {
