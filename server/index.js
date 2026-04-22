@@ -3,6 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const passport = require('passport');
 const syncService = require('./services/syncService');
+const transcodeSession = require('./services/transcodeSession');
 
 // Initialize database
 require('./db');
@@ -153,8 +154,15 @@ async function loadPlugins() {
 }
 
 // Graceful shutdown handler for plugins with shutdown hooks
-process.on('SIGTERM', async () => {
-    console.log('SIGTERM received, shutting down plugins...');
+let isShuttingDown = false;
+
+// Graceful shutdown handler for plugins + transcode sessions
+async function handleShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    console.log(`${signal} received, shutting down plugins and transcode sessions...`);
+
     for (const { name, plugin } of loadedPlugins) {
         if (plugin && typeof plugin.shutdown === 'function') {
             try {
@@ -165,7 +173,23 @@ process.on('SIGTERM', async () => {
             }
         }
     }
+
+    try {
+        await transcodeSession.shutdownAllSessions();
+        console.log('✓ Transcode sessions cleaned up');
+    } catch (err) {
+        console.error('✗ Error cleaning transcode sessions during shutdown:', err);
+    }
+
     process.exit(0);
+}
+
+process.on('SIGTERM', () => {
+    handleShutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+    handleShutdown('SIGINT');
 });
 
 // API Routes

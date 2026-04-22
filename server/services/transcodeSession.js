@@ -1842,6 +1842,22 @@ async function removeSession(sessionId) {
     }
 }
 
+async function shutdownAllSessions() {
+    console.log('[TranscodeSession] Shutdown cleanup starting...');
+
+    const ids = Array.from(sessions.keys());
+
+    for (const id of ids) {
+        try {
+            await removeSession(id);
+        } catch (err) {
+            console.error(`[TranscodeSession] Failed to remove session ${id} during shutdown:`, err?.message || err);
+        }
+    }
+
+    console.log('[TranscodeSession] Shutdown cleanup finished');
+}
+
 /**
  * Cleanup stale sessions (idle for too long)
  */
@@ -1912,6 +1928,7 @@ module.exports = {
     getSession,
     getOrCreateSession,
     removeSession,
+    shutdownAllSessions,
     cleanupStaleSessions,
     recoverSessions,
     startCleanupInterval,
